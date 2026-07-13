@@ -59,6 +59,9 @@ targets:
         SWIFT_VERSION: "5.10"
         TARGETED_DEVICE_FAMILY: "1,2"
         ENABLE_USER_SCRIPT_SANDBOXING: true
+        # App icon lives in App/Assets.xcassets/AppIcon.appiconset. XcodeGen
+        # auto-includes the .xcassets as a resource; this names the icon set.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         # Principle 7: no network entitlement. Nothing here requests one, and
         # no networking framework is linked. Keep it that way.
         CODE_SIGN_ENTITLEMENTS: ""
