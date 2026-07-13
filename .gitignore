@@ -19,3 +19,7 @@ Package.resolved
 
 # Fixture scratch
 Tests/Fixtures/generated/
+
+# Bundled ML checkpoints — each developer fetches once, never in git
+# (docs/whisperkit-model-bundling.md)
+WhisperKitModels/

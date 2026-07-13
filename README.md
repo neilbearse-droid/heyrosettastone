@@ -5,10 +5,10 @@ understands and strangers don't. Rosetta is a digitized communication
 dictionary with a learning layer: the family confirms what an utterance meant,
 the app accumulates those confirmations, and the guessing gets shorter.
 
-This repository implements **Phase 1** of [`rosetta_spec.md`](rosetta_spec.md):
-capture and board, no ML. Read the spec in full before changing anything —
-section 2 lists nine product principles that are hard constraints, not
-suggestions.
+This repository implements **Phases 1 and 2** of
+[`rosetta_spec.md`](rosetta_spec.md): capture and board, plus ranking. Read
+the spec in full before changing anything — section 2 lists nine product
+principles that are hard constraints, not suggestions.
 
 ## What works in Phase 1
 
@@ -31,17 +31,44 @@ suggestions.
 - **Recording trust** — persistent on-screen indicator, one-tap pause,
   plain-language first-run screen.
 
+## What Phase 2 adds (ranking)
+
+- **Embeddings** — WhisperKit's audio encoder (tiny checkpoint, encoder
+  only, never transcription), mean-pooled to a fixed vector per segment,
+  computed near capture time. The checkpoint must be **bundled** — Rosetta
+  never downloads it (see
+  [`docs/whisperkit-model-bundling.md`](docs/whisperkit-model-bundling.md)).
+  Without a bundled model the app runs exactly as Phase 1.
+- **kNN ranking** — cosine k-nearest-neighbour over all exemplars (never
+  class prototypes; apraxic classes are multimodal), with 90-day half-life
+  recency decay and a decay-exempt flag. Old exemplars fade in influence
+  but are never deleted.
+- **Context priors** — smoothed hour-of-day, station, and just-confirmed
+  recency multipliers. Exactly 1 with no history.
+- **Per-intent calibration** — a logistic per word over its accept/reject
+  history; a wrong-and-rejected guess measurably tightens that word's
+  threshold.
+- **Maturity gates** — a word is suggested only after 5+ confirmed
+  exemplars and a ≥0.7 leave-one-out top-3 hit rate on its own clips.
+- **Top-3 in the UI** — "Maybe: banana?" buttons with confidence dots on
+  the Confirm card (tap accepts, ✕ dismisses and is final) and read-only
+  live guesses on Listen. Progress explains per word whether the model is
+  guessing, learning (n of 5), or needs more varied clips.
+
 ## What is deliberately absent
 
-- No ML. The `Model/` directory holds only the Phase 1 frequency ranker and
-  the interfaces Phase 2 will fill (embeddings, kNN, calibration, priors).
 - No networking. The app links no networking framework and requests no
-  network entitlement. Audio never leaves the device. This is structural,
-  not a setting.
-- No accounts, no analytics, no third-party SDKs beyond GRDB.
-- WhisperKit and the Silero VAD runtime arrive in Phase 2. Phase 1 ships an
-  energy-based VAD behind the same protocol; the Silero conversion step is
-  documented in [`docs/silero-vad-conversion.md`](docs/silero-vad-conversion.md).
+  network entitlement; the ML checkpoint ships in the bundle rather than
+  downloading. Audio never leaves the device. This is structural, not a
+  setting.
+- No accounts, no analytics, no third-party SDKs beyond GRDB and WhisperKit.
+- No gradient training on device: learning is append-only exemplar
+  accumulation plus threshold calibration (§5.1).
+- The Silero VAD runtime is still pending; Phase 1's energy VAD serves
+  behind the same protocol, and the conversion step is documented in
+  [`docs/silero-vad-conversion.md`](docs/silero-vad-conversion.md).
+- Phase 3: guest mode, speaker filtering, multi-station sync, SLP PDF
+  export, board layout editing.
 
 ## Building
 
@@ -66,9 +93,9 @@ xcodebuild test -scheme Rosetta -destination 'platform=iOS Simulator,name=iPhone
 | `App/`     | SwiftUI app, parent tabs, setup interview, confirm/review UI |
 | `Board/`   | Child board: fixed grid, layout rules, speech output |
 | `Capture/` | Audio engine, VAD, session buffer, segment writer |
-| `Model/`   | Phase 1 frequency ranker; Phase 2 seams (embeddings, kNN) |
+| `Model/`   | Embeddings, kNN ranker, calibration, priors, maturity, suggestion engine |
 | `Data/`    | GRDB schema, stores, file protection, export |
-| `Tests/`   | The section 10 tests: buffer stamping, board immutability, two-tap path, review expiry |
+| `Tests/`   | Section 10 tests: buffer stamping, board immutability, two-tap path, review expiry, kNN with recency weighting on fixture embeddings, calibration, maturity |
 
 ## Principles enforced in code
 
