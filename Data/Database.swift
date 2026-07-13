@@ -93,6 +93,26 @@ final class AppDatabase {
             try db.create(index: "events_type_time", on: "events", columns: ["type", "timestamp"])
         }
 
+        // Phase 2: ranking. Segments carry their embedding from capture time
+        // so the Confirm card ranks without re-encoding, and calibration
+        // observations record (score, accepted) pairs per intent so each
+        // word learns its own threshold (§5.2).
+        migrator.registerMigration("v2-ranking") { db in
+            try db.alter(table: "segments") { t in
+                t.add(column: "embedding", .blob)
+            }
+
+            try db.create(table: "calibrationObservations") { t in
+                t.column("id", .text).primaryKey()
+                t.column("intentId", .text).notNull()
+                    .references("intents", onDelete: .cascade)
+                t.column("score", .double).notNull()
+                t.column("accepted", .boolean).notNull()
+                t.column("timestamp", .datetime).notNull()
+            }
+            try db.create(index: "calibration_intent", on: "calibrationObservations", columns: ["intentId"])
+        }
+
         return migrator
     }
 }

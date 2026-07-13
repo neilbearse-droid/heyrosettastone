@@ -104,6 +104,7 @@ struct ExemplarStore {
                 let exemplar = ExemplarRecord(
                     intentId: intentId,
                     clipRef: segment.clipRef,
+                    embedding: segment.embedding,
                     device: device,
                     contextJSON: contextJSON,
                     labeller: labeller,
@@ -186,6 +187,33 @@ struct SessionStore {
             segment.state = state.rawValue
             segment.labelledAt = (state == .labelled || state == .discarded || state == .notHim) ? date : nil
             try segment.update(db)
+        }
+    }
+
+    func updateSegmentEmbedding(id: String, embedding: Data) throws {
+        try db.dbQueue.write { db in
+            guard var segment = try SegmentRecord.fetchOne(db, key: id) else { return }
+            segment.embedding = embedding
+            try segment.update(db)
+        }
+    }
+}
+
+// MARK: - Calibration
+
+struct CalibrationStore {
+    let db: AppDatabase
+
+    func record(_ observation: CalibrationObservationRecord) throws {
+        try db.dbQueue.write { try observation.insert($0) }
+    }
+
+    func observations(intentId: String) throws -> [CalibrationObservationRecord] {
+        try db.dbQueue.read {
+            try CalibrationObservationRecord
+                .filter(Column("intentId") == intentId)
+                .order(Column("timestamp"))
+                .fetchAll($0)
         }
     }
 }

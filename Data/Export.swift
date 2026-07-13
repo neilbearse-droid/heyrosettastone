@@ -17,6 +17,7 @@ struct RosettaExporter {
         var events: [EventRecord]
         var sessions: [SessionRecord]
         var segments: [SegmentRecord]
+        var calibrationObservations: [CalibrationObservationRecord] = []
     }
 
     /// Builds `Rosetta-export-<date>.zip` in a temporary directory and
@@ -37,7 +38,8 @@ struct RosettaExporter {
                 negatives: try NegativeRecord.fetchAll(db),
                 events: try EventRecord.fetchAll(db),
                 sessions: try SessionRecord.fetchAll(db),
-                segments: try SegmentRecord.fetchAll(db)
+                segments: try SegmentRecord.fetchAll(db),
+                calibrationObservations: try CalibrationObservationRecord.fetchAll(db)
             )
         }
         let encoder = JSONEncoder()
@@ -86,6 +88,7 @@ struct RosettaExporter {
     func wipeAll() throws {
         try db.dbQueue.write { db in
             // Order respects foreign keys.
+            try db.execute(sql: "DELETE FROM calibrationObservations")
             try db.execute(sql: "DELETE FROM exemplars")
             try db.execute(sql: "DELETE FROM negatives")
             try db.execute(sql: "DELETE FROM segments")

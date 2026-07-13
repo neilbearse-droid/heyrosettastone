@@ -208,6 +208,9 @@ struct SegmentRecord: Codable, Identifiable, Equatable, FetchableRecord, Persist
     var durationMs: Int
     var state: String
     var labelledAt: Date?
+    /// Encoder embedding computed at (or shortly after) capture, so ranking
+    /// and confirmation reuse it without re-encoding (§5.7 latency budget).
+    var embedding: Data?
 
     init(id: String = UUID().uuidString,
          sessionId: String,
@@ -215,7 +218,8 @@ struct SegmentRecord: Codable, Identifiable, Equatable, FetchableRecord, Persist
          startedAt: Date,
          durationMs: Int,
          state: SegmentState = .pending,
-         labelledAt: Date? = nil) {
+         labelledAt: Date? = nil,
+         embedding: Data? = nil) {
         self.id = id
         self.sessionId = sessionId
         self.clipRef = clipRef
@@ -223,7 +227,36 @@ struct SegmentRecord: Codable, Identifiable, Equatable, FetchableRecord, Persist
         self.durationMs = durationMs
         self.state = state.rawValue
         self.labelledAt = labelledAt
+        self.embedding = embedding
     }
 
     var segmentState: SegmentState? { SegmentState(rawValue: state) }
+}
+
+// MARK: - Calibration observation
+
+/// One shown-guess outcome: the raw score the ranker produced and whether
+/// the family accepted it. Fitting a per-intent logistic over these is how
+/// each word learns its own distance threshold (§5.2); a wrong-and-rejected
+/// guess tightens it.
+struct CalibrationObservationRecord: Codable, Identifiable, Equatable, FetchableRecord, PersistableRecord {
+    static let databaseTableName = "calibrationObservations"
+
+    var id: String
+    var intentId: String
+    var score: Double
+    var accepted: Bool
+    var timestamp: Date
+
+    init(id: String = UUID().uuidString,
+         intentId: String,
+         score: Double,
+         accepted: Bool,
+         timestamp: Date = Date()) {
+        self.id = id
+        self.intentId = intentId
+        self.score = score
+        self.accepted = accepted
+        self.timestamp = timestamp
+    }
 }
