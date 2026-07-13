@@ -105,6 +105,7 @@ struct ReviewView: View {
             intentId: intent.id,
             device: env.capture.stationName
         ))
+        Task { await env.suggestions.reload() }
         reload()
     }
 

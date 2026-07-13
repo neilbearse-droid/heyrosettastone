@@ -8,9 +8,15 @@ import SwiftUI
 struct ProgressTabView: View {
     @Environment(AppEnvironment.self) private var env
 
+    struct WordRow {
+        let label: String
+        let count: Int
+        let maturity: MaturityGate.Report?
+    }
+
     @State private var totalExemplars = 0
     @State private var wordCount = 0
-    @State private var perIntent: [(label: String, count: Int)] = []
+    @State private var perIntent: [WordRow] = []
     @State private var latencyTrend: [(day: Date, medianMs: Int)] = []
 
     var body: some View {
@@ -49,17 +55,25 @@ struct ProgressTabView: View {
                 Section {
                     ForEach(perIntent, id: \.label) { row in
                         HStack {
-                            Text(row.label)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(row.label)
+                                Text(maturityCaption(row))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                             Spacer()
                             Text("\(row.count) clip\(row.count == 1 ? "" : "s")")
                                 .foregroundStyle(.secondary)
                                 .monospacedDigit()
+                            maturityBadge(row)
                         }
                     }
                 } header: {
-                    Text("Clips per word")
+                    Text("What the model knows, word by word")
                 } footer: {
-                    Text("Words with more confirmed clips will be the first the app can help guess, once guessing arrives. Around 5 to 15 per word is the useful range.")
+                    Text(env.suggestions.isModelAvailable
+                        ? "A word starts getting guessed once it has 5 confirmed clips and the model recognizes its own examples reliably. More confirmations always help."
+                        : "Guessing is off — no recognition model is bundled in this build. Every confirmation still counts; guesses appear the moment a model is added.")
                 }
             }
             .navigationTitle("Progress")
@@ -80,12 +94,46 @@ struct ProgressTabView: View {
         .background(RoundedRectangle(cornerRadius: 16).fill(Color(.secondarySystemBackground)))
     }
 
+    // §5.6: per-word maturity, so the family sees exactly which words the
+    // model knows and which need more confirmations. Framed around the
+    // family's accumulated knowledge, never as a score for him (§7 tone).
+    private func maturityCaption(_ row: WordRow) -> String {
+        guard env.suggestions.isModelAvailable else { return "counting confirmations" }
+        guard let report = row.maturity else { return "counting confirmations" }
+        if report.isSuggestible {
+            let pct = Int(((report.looTop3HitRate ?? 0) * 100).rounded())
+            return "guessing live — recognizes \(pct)% of its own clips"
+        }
+        if report.exemplarCount < MaturityGate.Config().minExemplars {
+            return "learning — \(report.exemplarCount) of \(MaturityGate.Config().minExemplars) clips needed"
+        }
+        return "needs more varied clips before guessing"
+    }
+
+    @ViewBuilder
+    private func maturityBadge(_ row: WordRow) -> some View {
+        if row.maturity?.isSuggestible == true {
+            Image(systemName: "checkmark.seal.fill")
+                .foregroundStyle(.tint)
+                .accessibilityLabel("Being suggested")
+        }
+    }
+
     private func reload() {
         let intents = (try? env.intents.all()) ?? []
         wordCount = intents.count
         totalExemplars = (try? env.exemplars.totalCount()) ?? 0
+        let reports = Dictionary(
+            uniqueKeysWithValues: env.suggestions.maturityReports.map { ($0.intentId, $0) }
+        )
         perIntent = intents
-            .map { (label: $0.label, count: (try? env.exemplars.count(intentId: $0.id)) ?? 0) }
+            .map { intent in
+                WordRow(
+                    label: intent.label,
+                    count: (try? env.exemplars.count(intentId: intent.id)) ?? 0,
+                    maturity: reports[intent.id]
+                )
+            }
             .sorted { $0.count > $1.count }
         let monthAgo = Date().addingTimeInterval(-30 * 24 * 3600)
         latencyTrend = (try? env.events.confirmLatencies(since: monthAgo)) ?? []

@@ -13,6 +13,7 @@ struct ConfirmCardView: View {
     @State private var counts: [String: Int] = [:]
     @State private var showingAskBoard = false
     @State private var savedBanner: String?
+    @State private var topGuesses: [Suggestion] = []
 
     var body: some View {
         NavigationStack {
@@ -64,9 +65,45 @@ struct ConfirmCardView: View {
                                     isSelected: model.selectedSegmentIds.contains(segment.id),
                                     isPlaying: player.playingClipRef == segment.clipRef,
                                     onPlay: { player.toggle(clipRef: segment.clipRef) },
-                                    onToggle: { model.toggleSegment(segment.id) }
+                                    onToggle: {
+                                        model.toggleSegment(segment.id)
+                                        refreshGuesses(model)
+                                    }
                                 )
                             }
+                        }
+                    }
+                }
+
+                // Top-3 guesses (§4.5), tentative copy always (§2.6). Tap
+                // accepts; the ✕ dismisses — and a dismissed guess stays
+                // dismissed (§2.4).
+                if !topGuesses.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Best guesses — tap if right, ✕ if wrong")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        ForEach(topGuesses) { guess in
+                            GuessButton(
+                                guess: guess,
+                                onAccept: {
+                                    env.suggestions.recordOutcome(
+                                        intentId: guess.intent.id,
+                                        rawScore: guess.rawScore,
+                                        accepted: true
+                                    )
+                                    confirm(guess.intent, with: model)
+                                },
+                                onDismiss: {
+                                    env.suggestions.recordOutcome(
+                                        intentId: guess.intent.id,
+                                        rawScore: guess.rawScore,
+                                        accepted: false
+                                    )
+                                    model.dismiss(intentId: guess.intent.id)
+                                    refreshGuesses(model)
+                                }
+                            )
                         }
                     }
                 }
@@ -122,10 +159,22 @@ struct ConfirmCardView: View {
         }
     }
 
+    private func refreshGuesses(_ model: ConfirmViewModel) {
+        Task {
+            topGuesses = await env.suggestions.suggestions(
+                for: model.selectedSegments,
+                station: env.capture.stationName,
+                excluding: model.dismissedIntentIds
+            )
+        }
+    }
+
     private func confirm(_ intent: IntentRecord, with model: ConfirmViewModel) {
         guard let created = try? model.confirm(intentId: intent.id), !created.isEmpty else { return }
         savedBanner = "Saved \(created.count) clip\(created.count == 1 ? "" : "s") as “\(intent.label)”"
+        topGuesses = []
         env.capture.clearRecentSegments()
+        Task { await env.suggestions.reload() }
         // Keep the banner visible briefly on the emptied card.
         Task {
             try? await Task.sleep(for: .seconds(3))
@@ -137,6 +186,7 @@ struct ConfirmCardView: View {
 
     private func skip(_ model: ConfirmViewModel) {
         model.skip()
+        topGuesses = []
         env.capture.clearRecentSegments()
         reload()
     }
@@ -158,11 +208,53 @@ struct ConfirmCardView: View {
                 labeller: env.labeller,
                 db: env.db
             )
+            if let model { refreshGuesses(model) }
         }
     }
 }
 
 // MARK: - Pieces
+
+/// One tentative guess: "Maybe: banana?" with confidence dots and an
+/// explicit dismiss. Large targets — this is the two-tap fast path.
+struct GuessButton: View {
+    let guess: Suggestion
+    let onAccept: () -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button(action: onAccept) {
+                HStack {
+                    Text("Maybe: \(guess.intent.label)?")
+                        .font(.title3.weight(.semibold))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                    Spacer()
+                    HStack(spacing: 3) {
+                        ForEach(0..<3, id: \.self) { dot in
+                            Circle()
+                                .fill(dot < guess.confidenceDots ? Color.accentColor : Color(.tertiarySystemFill))
+                                .frame(width: 8, height: 8)
+                        }
+                    }
+                    .accessibilityLabel("Confidence \(guess.confidenceDots) of 3")
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 14)
+                .background(RoundedRectangle(cornerRadius: 14).fill(Color.accentColor.opacity(0.12)))
+            }
+            .buttonStyle(.plain)
+
+            Button(action: onDismiss) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(.secondary)
+            }
+            .accessibilityLabel("No, not \(guess.intent.label)")
+        }
+    }
+}
 
 struct SegmentChip: View {
     let segment: SegmentRecord

@@ -26,6 +26,12 @@ final class CaptureController: SessionBufferDelegate {
     private let sessions: SessionStore
     private let events: EventLog
 
+    /// Set by the app once the encoder model is loaded: embeds a fresh
+    /// segment's samples near capture time (§5.7) so ranking is instant at
+    /// the Confirm card. Nil when no model is bundled — capture is
+    /// deliberately ignorant of ML beyond this hook.
+    var embedSamples: (([Float]) async -> Data?)?
+
     /// Maps the sample-clock to wall time: the Date at stream position 0.
     private var streamStartDate = Date()
     /// Wall-clock open time of the active session, for confirm latency.
@@ -101,6 +107,18 @@ final class CaptureController: SessionBufferDelegate {
             try sessions.insertSegment(record)
             Task { @MainActor in
                 self.recentSegments.append(record)
+            }
+            if let embedSamples {
+                let samples = segment.samples
+                Task { [weak self] in
+                    guard let self, let blob = await embedSamples(samples) else { return }
+                    try? self.sessions.updateSegmentEmbedding(id: record.id, embedding: blob)
+                    await MainActor.run {
+                        if let i = self.recentSegments.firstIndex(where: { $0.id == record.id }) {
+                            self.recentSegments[i].embedding = blob
+                        }
+                    }
+                }
             }
         } catch {
             Task { @MainActor in

@@ -7,6 +7,9 @@ import Observation
 final class AppEnvironment {
     let db: AppDatabase
     let capture: CaptureController
+    /// Phase 2 ranking. Inert (empty suggestions, Phase 1 behaviour) until
+    /// start() finds a bundled encoder model.
+    let suggestions: SuggestionEngine
 
     var intents: IntentStore { IntentStore(db: db) }
     var exemplars: ExemplarStore { ExemplarStore(db: db) }
@@ -35,6 +38,7 @@ final class AppEnvironment {
     init(db: AppDatabase) {
         self.db = db
         self.capture = CaptureController(db: db)
+        self.suggestions = SuggestionEngine(db: db)
         self.labeller = UserDefaults.standard.string(forKey: "labellerName") ?? "Parent"
         self.hasCompletedFirstRun = UserDefaults.standard.bool(forKey: "hasCompletedFirstRun")
         self.hasCompletedSetupInterview = UserDefaults.standard.bool(forKey: "hasCompletedSetupInterview")

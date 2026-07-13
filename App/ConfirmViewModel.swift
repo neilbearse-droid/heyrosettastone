@@ -69,6 +69,7 @@ final class ConfirmViewModel {
             try? exemplarStore.recordNegative(NegativeRecord(
                 rejectedIntentId: intentId,
                 clipRef: segment.clipRef,
+                embedding: segment.embedding,
                 exchangeId: exchangeId,
                 timestamp: now
             ))

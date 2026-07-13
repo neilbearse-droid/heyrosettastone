@@ -7,6 +7,7 @@ struct ListenView: View {
     let enterChildMode: () -> Void
 
     @State private var showingSettings = false
+    @State private var liveGuesses: [Suggestion] = []
 
     var body: some View {
         NavigationStack {
@@ -18,6 +19,9 @@ struct ListenView: View {
 
                 if env.capture.isListening {
                     statusText
+                    if !liveGuesses.isEmpty {
+                        liveGuessStrip
+                    }
                 } else {
                     Text("Not recording. Tap Listen when you want to start catching his words.")
                         .multilineTextAlignment(.center)
@@ -77,6 +81,46 @@ struct ListenView: View {
                 }
             }
             .sheet(isPresented: $showingSettings) { SettingsView() }
+            .onChange(of: env.capture.recentSegments) { refreshLiveGuesses() }
+        }
+    }
+
+    /// Live top-3 during an exchange (§4.5). Read-only here — resolving
+    /// happens on the Confirm card. Copy stays tentative (§2.6).
+    private var liveGuessStrip: some View {
+        VStack(spacing: 6) {
+            ForEach(liveGuesses) { guess in
+                HStack {
+                    Text("Maybe: \(guess.intent.label)?")
+                        .font(.headline)
+                    Spacer()
+                    HStack(spacing: 3) {
+                        ForEach(0..<3, id: \.self) { dot in
+                            Circle()
+                                .fill(dot < guess.confidenceDots ? Color.accentColor : Color(.tertiarySystemFill))
+                                .frame(width: 7, height: 7)
+                        }
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(RoundedRectangle(cornerRadius: 10).fill(Color(.secondarySystemBackground)))
+            }
+        }
+        .padding(.horizontal, 48)
+    }
+
+    private func refreshLiveGuesses() {
+        let segments = env.capture.recentSegments.filter { $0.segmentState == .pending }
+        guard !segments.isEmpty else {
+            liveGuesses = []
+            return
+        }
+        Task {
+            liveGuesses = await env.suggestions.suggestions(
+                for: segments,
+                station: env.capture.stationName
+            )
         }
     }
 

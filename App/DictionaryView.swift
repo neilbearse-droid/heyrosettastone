@@ -136,6 +136,7 @@ struct IntentDetailView: View {
                         for index in offsets {
                             try? env.exemplars.delete(id: exemplars[index].id)
                         }
+                        Task { await env.suggestions.reload() }
                         refresh()
                     }
                 }
@@ -163,6 +164,7 @@ struct IntentDetailView: View {
         .alert("Delete “\(intent?.label ?? "")”?", isPresented: $confirmingDelete) {
             Button("Delete forever", role: .destructive) {
                 try? env.intents.deleteForever(id: intentId)
+                Task { await env.suggestions.reload() }
                 onChange()
                 dismiss()
             }
