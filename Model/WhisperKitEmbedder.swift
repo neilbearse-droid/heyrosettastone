@@ -78,8 +78,12 @@ final class WhisperKitEmbedder: EmbeddingProvider {
                 .update(from: source.baseAddress!, count: Self.windowSamples)
         }
 
+        // WhisperKit's protocols return `any FeatureExtractorOutputType` /
+        // `any AudioEncoderOutputType` to allow non-CoreML backends; the
+        // default backend's concrete type is MLMultiArray.
         guard let mel = try await whisperKit.featureExtractor.logMelSpectrogram(fromAudio: audioArray),
-              let encoded = try await whisperKit.audioEncoder.encodeFeatures(mel)
+              let encodedOutput = try await whisperKit.audioEncoder.encodeFeatures(mel),
+              let encoded = encodedOutput as? MLMultiArray
         else { throw EmbedError.unexpectedEncoderOutput }
 
         // Pool only over frames covering the real utterance, not the padded
