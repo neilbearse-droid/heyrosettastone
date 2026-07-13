@@ -39,7 +39,10 @@ final class SuggestionEngine {
     /// Skip guesses this improbable rather than show noise.
     private let probabilityFloor = 0.05
 
-    init(db: AppDatabase) {
+    // nonisolated: only stores the reference, so it can be called from
+    // AppEnvironment's nonisolated init; all state-touching work happens in
+    // the MainActor-isolated methods.
+    nonisolated init(db: AppDatabase) {
         self.db = db
     }
 
