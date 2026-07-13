@@ -27,16 +27,19 @@ struct EmbeddingBackfill {
     }
 
     private func backfillExemplars() async -> Int {
-        let missing = (try? db.dbQueue.read {
+        // In async contexts Swift resolves GRDB's read/write to the async
+        // overloads, hence the awaits throughout this file.
+        let missing = (try? await db.dbQueue.read {
             try ExemplarRecord.filter(Column("embedding") == nil).fetchAll($0)
         }) ?? []
         var count = 0
         for exemplar in missing {
             guard let blob = await embedClip(exemplar.clipRef) else { continue }
-            try? db.dbQueue.write { db in
+            let id = exemplar.id
+            try? await db.dbQueue.write { db in
                 try db.execute(
                     sql: "UPDATE exemplars SET embedding = ? WHERE id = ?",
-                    arguments: [blob, exemplar.id]
+                    arguments: [blob, id]
                 )
             }
             count += 1
@@ -48,7 +51,7 @@ struct EmbeddingBackfill {
         // Only pending segments matter — they may still be labelled, and the
         // Confirm card ranks them. Resolved segments' audio lives on via the
         // exemplar rows.
-        let missing = (try? db.dbQueue.read {
+        let missing = (try? await db.dbQueue.read {
             try SegmentRecord
                 .filter(Column("embedding") == nil && Column("state") == SegmentState.pending.rawValue)
                 .fetchAll($0)
@@ -63,7 +66,7 @@ struct EmbeddingBackfill {
     }
 
     private func backfillNegatives() async -> Int {
-        let missing = (try? db.dbQueue.read {
+        let missing = (try? await db.dbQueue.read {
             try NegativeRecord
                 .filter(Column("embedding") == nil && Column("clipRef") != nil)
                 .fetchAll($0)
@@ -72,10 +75,11 @@ struct EmbeddingBackfill {
         for negative in missing {
             guard let clipRef = negative.clipRef,
                   let blob = await embedClip(clipRef) else { continue }
-            try? db.dbQueue.write { db in
+            let id = negative.id
+            try? await db.dbQueue.write { db in
                 try db.execute(
                     sql: "UPDATE negatives SET embedding = ? WHERE id = ?",
-                    arguments: [blob, negative.id]
+                    arguments: [blob, id]
                 )
             }
             count += 1

@@ -147,11 +147,10 @@ final class SuggestionEngine {
             now: now
         )
 
-        let intentById: [String: IntentRecord] = Dictionary(
-            uniqueKeysWithValues: ((try? db.dbQueue.read {
-                try IntentRecord.filter(Column("archivedAt") == nil).fetchAll($0)
-            }) ?? []).map { ($0.id, $0) }
-        )
+        let activeIntents = (try? await db.dbQueue.read {
+            try IntentRecord.filter(Column("archivedAt") == nil).fetchAll($0)
+        }) ?? []
+        let intentById = Dictionary(uniqueKeysWithValues: activeIntents.map { ($0.id, $0) })
 
         return ranked
             .filter { suggestibleIntents.contains($0.intentId) && !dismissed.contains($0.intentId) }
