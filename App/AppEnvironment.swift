@@ -16,25 +16,28 @@ final class AppEnvironment {
     var board: BoardStore { BoardStore(db: db) }
     var exporter: RosettaExporter { RosettaExporter(db: db) }
 
+    // Stored (not computed) so @Observable notifies views when they change;
+    // didSet persists to UserDefaults.
+
     /// Who is holding the phone — attached to every exemplar (§12).
     var labeller: String {
-        get { UserDefaults.standard.string(forKey: "labellerName") ?? "Parent" }
-        set { UserDefaults.standard.set(newValue, forKey: "labellerName") }
+        didSet { UserDefaults.standard.set(labeller, forKey: "labellerName") }
     }
 
     var hasCompletedFirstRun: Bool {
-        get { UserDefaults.standard.bool(forKey: "hasCompletedFirstRun") }
-        set { UserDefaults.standard.set(newValue, forKey: "hasCompletedFirstRun") }
+        didSet { UserDefaults.standard.set(hasCompletedFirstRun, forKey: "hasCompletedFirstRun") }
     }
 
     var hasCompletedSetupInterview: Bool {
-        get { UserDefaults.standard.bool(forKey: "hasCompletedSetupInterview") }
-        set { UserDefaults.standard.set(newValue, forKey: "hasCompletedSetupInterview") }
+        didSet { UserDefaults.standard.set(hasCompletedSetupInterview, forKey: "hasCompletedSetupInterview") }
     }
 
     init(db: AppDatabase) {
         self.db = db
         self.capture = CaptureController(db: db)
+        self.labeller = UserDefaults.standard.string(forKey: "labellerName") ?? "Parent"
+        self.hasCompletedFirstRun = UserDefaults.standard.bool(forKey: "hasCompletedFirstRun")
+        self.hasCompletedSetupInterview = UserDefaults.standard.bool(forKey: "hasCompletedSetupInterview")
     }
 
     static func live() -> AppEnvironment {

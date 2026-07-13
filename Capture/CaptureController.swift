@@ -14,10 +14,10 @@ final class CaptureController: SessionBufferDelegate {
     private(set) var recentSegments: [SegmentRecord] = []
     private(set) var lastError: String?
 
-    /// Station identity for context priors, e.g. "Kitchen" (§5.3).
+    /// Station identity for context priors, e.g. "Kitchen" (§5.3). Stored so
+    /// @Observable notifies; didSet persists.
     var stationName: String {
-        get { UserDefaults.standard.string(forKey: "stationName") ?? "Home" }
-        set { UserDefaults.standard.set(newValue, forKey: "stationName") }
+        didSet { UserDefaults.standard.set(stationName, forKey: "stationName") }
     }
 
     private let engine = AudioCaptureEngine()
@@ -34,6 +34,7 @@ final class CaptureController: SessionBufferDelegate {
     init(db: AppDatabase) {
         self.sessions = SessionStore(db: db)
         self.events = EventLog(db: db)
+        self.stationName = UserDefaults.standard.string(forKey: "stationName") ?? "Home"
         self.buffer = SessionBuffer()
         self.buffer.delegate = self
     }
