@@ -28,6 +28,15 @@ targets:
       - Capture
       - Model
       - Data
+      # Bundled Core ML encoder (blue folder reference so the .mlmodelc
+      # directory structure survives into the app bundle). Each developer
+      # fetches this locally — see docs/whisperkit-model-bundling.md — and
+      # it is gitignored, so `optional: true` keeps `xcodegen generate`
+      # working for anyone who hasn't downloaded it yet (they just get
+      # Phase 1 behaviour until they do).
+      - path: WhisperKitModels/openai_whisper-tiny
+        type: folder
+        optional: true
     dependencies:
       - package: GRDB
         product: GRDB
