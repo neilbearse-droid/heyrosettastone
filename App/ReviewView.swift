@@ -121,6 +121,7 @@ struct ReviewView: View {
         ))
         let suggestions = env.suggestions
         Task { await suggestions.reload() }
+        env.capture.refreshSegmentStates()
         reload()
     }
 
@@ -138,6 +139,7 @@ struct ReviewView: View {
         default:
             try? env.sessions.updateSegmentState(id: segment.id, state: state)
         }
+        env.capture.refreshSegmentStates()
         reload()
     }
 

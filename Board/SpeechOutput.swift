@@ -42,6 +42,13 @@ final class SpeechOutput: NSObject, AVSpeechSynthesizerDelegate {
         selfSpeakingUntilLock.withLock { $0 }
     }
 
+    /// The utterance we most recently asked for. `stopSpeaking(at:)` on a
+    /// fast second tap delivers `didCancel` for the *previous* utterance after
+    /// `speak` has already set the new pessimistic gate; ignoring callbacks
+    /// for any other utterance keeps the gate honest.
+    @ObservationIgnored
+    private var currentUtterance: AVSpeechUtterance?
+
     @ObservationIgnored
     private var preparedVoice: AVSpeechSynthesisVoice?
     @ObservationIgnored
@@ -84,6 +91,7 @@ final class SpeechOutput: NSObject, AVSpeechSynthesizerDelegate {
             utterance.voice = voice
         }
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate * 0.9
+        currentUtterance = utterance
         synthesizer.speak(utterance)
     }
 
@@ -107,10 +115,12 @@ final class SpeechOutput: NSObject, AVSpeechSynthesizerDelegate {
     }
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        guard utterance === currentUtterance else { return }
         finished()
     }
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+        guard utterance === currentUtterance else { return }
         finished()
     }
 
@@ -119,6 +129,7 @@ final class SpeechOutput: NSObject, AVSpeechSynthesizerDelegate {
     private func finished() {
         setSelfSpeakingUntil(Date().addingTimeInterval(Self.selfSpeechTail))
         isSpeaking = false
+        currentUtterance = nil
     }
 
     private func setSelfSpeakingUntil(_ date: Date) {

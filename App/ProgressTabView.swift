@@ -54,7 +54,7 @@ struct ProgressTabView: View {
                         .listRowBackground(Color.clear)
                     } footer: {
                         if let abandonedRate {
-                            Text("Got there means confirmed on the card or labelled in Review within a day. \(Int((abandonedRate * 100).rounded()))% went unresolved — those are the ones to catch sooner next time.")
+                            Text("Got there means confirmed on the card, resolved on his board, or labelled in Review within a day. Exchanges that turned out to be someone else are left out. \(Int((abandonedRate * 100).rounded()))% went unresolved; those are the ones to catch sooner next time.")
                         }
                     }
                 }
