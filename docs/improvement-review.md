@@ -737,6 +737,34 @@ variability), the 0.02 tolerance may reject true matches; raise
 `MaturityGate.Config.selfSimilarityTolerance` or lower the quantile. Log
 `Suggestion.bestSimilarity` against each word's floor for a few exchanges.
 
+### Built after the first on-device run (2026-11-01, later)
+
+| Commit | What |
+|--------|------|
+| 0fc8f11 | Self-similarity floor (above) |
+| 3e17ee9 | Model silence explained on Listen and Confirm; floor-miss counter; live top-3 accuracy from real confirmations in Progress; migration v4 (exchangeId, featureVersion on calibration observations) |
+| c8052d1 | Silero VAD behind the detector protocol with an optionally bundled Core ML model; energy VAD fallback; speech confidence on the level meter |
+| 5e81aec | Phase 3: guest view, SLP PDF report, board layout editor with relearning warning, opt-in start-listening-on-launch |
+
+Additional lines to check first in Xcode for this batch:
+
+9. `Model/SuggestionEngine.swift`: a stored `floorMisses` property and a
+   `floorMisses(for:)` method on the same `@Observable` class. Legal by
+   the language, unverified against the Observation macro; rename the
+   method to `floorMissCount(for:)` if it complains (one call site in
+   ProgressTabView).
+10. `Capture/SileroVAD.swift`: Core ML feature names and the `Float16`
+    output path. If `loadIfAvailable()` returns nil on a device that has
+    the model, construct `CoreMLSileroRunner(contentsOf:)` directly in a
+    debug build to see the exact `RunnerError`.
+11. `project.yml`: the optional `.mlpackage` source entry and
+    `COREML_CODEGEN_LANGUAGE: None`; run `xcodegen generate` with and
+    without `CoreMLModels/SileroVAD.mlpackage` present.
+12. `App/SettingsView.swift`: two `.sheet(item:)` modifiers and
+    `Bindable(env)` bindings for the new flags.
+13. `App/Components/SLPReport.swift`: `UIGraphicsPDFRendererFormat`
+    document-info keys; check pagination visually with a long dictionary.
+
 ### Nothing here has been compiled
 
 No Xcode was available where this work was done. Every file was read

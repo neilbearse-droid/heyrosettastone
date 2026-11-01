@@ -144,12 +144,15 @@ final class DiagnosticsTests: XCTestCase {
             try db.execute(
                 sql: "INSERT INTO intents (id, label, createdAt) VALUES (?, ?, ?)",
                 arguments: ["i", "banana", now])
+            // Stamped at the feature cutoff, not at the fixture's 2001 `now`:
+            // with a nil version column the timestamp decides, and the
+            // assertion below is that such a row still counts as current.
             try db.execute(
                 sql: """
                 INSERT INTO calibrationObservations (id, intentId, score, accepted, timestamp)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                arguments: ["o", "i", 1.2, true, now])
+                arguments: ["o", "i", 1.2, true, CalibrationFeature.versionCutoff])
         }
 
         let migrated = try AppDatabase(queue: queue)
