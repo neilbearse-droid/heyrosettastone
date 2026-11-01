@@ -187,6 +187,12 @@ struct ConfirmCardView: View {
 
             // Intent grid, frequency-sorted, searchable.
             VStack(alignment: .leading, spacing: 8) {
+                if let notice = declinedNotice(model) {
+                    Text(notice)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("The model has no guess for this one. Pick from the list.")
+                }
                 Text("What did he mean? One tap saves. Hold a word to mark it as a wrong guess.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
@@ -267,14 +273,28 @@ struct ConfirmCardView: View {
         let station = env.capture.stationName
         let suggestions = env.suggestions
         guessTask = Task {
-            let guesses = await suggestions.suggestions(
+            let result = await suggestions.suggestionsDetailed(
                 for: segments,
                 station: station,
                 excluding: excluding
             )
             guard !Task.isCancelled, !model.resolved else { return }
-            model.topGuesses = guesses
+            model.topGuesses = result.suggestions
+            model.declinedGuesses = result.declined
+            model.suggestionReason = result.reason
         }
+    }
+
+    /// The model is live, words are mature, and it chose to say nothing:
+    /// said out loud, quietly, so the empty guess list reads as deliberate
+    /// rather than broken. Nothing when no word has matured (the grid is
+    /// the normal path then) or when every mature word was dismissed.
+    private func declinedNotice(_ model: ConfirmViewModel) -> String? {
+        guard model.displayedGuesses.isEmpty,
+              case .nothingResembled(let checked)? = model.suggestionReason,
+              checked > 0
+        else { return nil }
+        return "None of his guessing words sounded like this — pick from the list"
     }
 
     /// The one dismissal path for ✕, the pinned board tap and the grid's
@@ -415,6 +435,15 @@ struct ConfirmCardView: View {
                 suggestions.recordOutcomes(
                     topGuesses: shown,
                     confirmed: confirmedIntentId,
+                    exchangeId: exchangeId
+                )
+            }
+        }
+        fresh.floorMissRecorder = { intentId, bestSimilarity, exchangeId in
+            MainActor.assumeIsolated {
+                suggestions.noteFloorMiss(
+                    intentId: intentId,
+                    bestSimilarity: bestSimilarity,
                     exchangeId: exchangeId
                 )
             }

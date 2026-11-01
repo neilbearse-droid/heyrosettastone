@@ -290,6 +290,65 @@ final class ConfirmFlowTests: XCTestCase {
         XCTAssertTrue(called, "the recorder is still invoked; the engine ignores an empty list")
     }
 
+    // MARK: - Floor misses: the parent confirmed what the floor declined
+
+    private func declined(_ intent: IntentRecord, cause: DeclinedGuess.Cause, similarity: Double = 0.6) -> DeclinedGuess {
+        DeclinedGuess(
+            intentId: intent.id, label: intent.label, bestSimilarity: similarity,
+            floor: 0.7, z: 0.3, probability: 0.3, cause: cause
+        )
+    }
+
+    func testConfirmingAWordDeclinedUnderItsFloorReportsAFloorMiss() throws {
+        let model = makeModel()
+        model.declinedGuesses = [declined(banana, cause: .underSimilarityFloor, similarity: 0.61)]
+        model.suggestionReason = .nothingResembled(checked: 1)
+
+        var recorded: (intentId: String, similarity: Double, exchangeId: String?)?
+        model.floorMissRecorder = { intentId, similarity, exchangeId in
+            recorded = (intentId: intentId, similarity: similarity, exchangeId: exchangeId)
+        }
+
+        _ = try model.confirm(intentId: banana.id)
+
+        let miss = try XCTUnwrap(recorded)
+        XCTAssertEqual(miss.intentId, banana.id)
+        XCTAssertEqual(miss.similarity, 0.61, accuracy: 1e-9, "the similarity the floor rejected, for tuning")
+        XCTAssertEqual(miss.exchangeId, sessionId)
+    }
+
+    func testConfirmingADifferentWordIsNotAFloorMiss() throws {
+        let model = makeModel()
+        model.declinedGuesses = [declined(banana, cause: .underSimilarityFloor)]
+
+        var called = false
+        model.floorMissRecorder = { _, _, _ in called = true }
+        _ = try model.confirm(intentId: outside.id)
+        XCTAssertFalse(called, "the floor was right: it was not banana")
+    }
+
+    func testOtherDeclineCausesAreNotFloorMisses() throws {
+        let model = makeModel()
+        model.declinedGuesses = [
+            declined(banana, cause: .underProbabilityFloor),
+            declined(outside, cause: .excluded),
+        ]
+        var called = false
+        model.floorMissRecorder = { _, _, _ in called = true }
+        _ = try model.confirm(intentId: banana.id)
+        XCTAssertFalse(called, "only the self-similarity floor is being tuned")
+    }
+
+    func testFloorMissIsNotReportedWhenTheSaveIsRefused() throws {
+        let model = makeModel()
+        model.declinedGuesses = [declined(outside, cause: .underSimilarityFloor)]
+        model.dismiss(intentId: outside.id)
+        var called = false
+        model.floorMissRecorder = { _, _, _ in called = true }
+        XCTAssertTrue(try model.confirm(intentId: outside.id).isEmpty)
+        XCTAssertFalse(called)
+    }
+
     // MARK: - D5: his own board tap is pinned
 
     func testBoardTapInThisExchangeIsPinnedUntilDismissed() throws {

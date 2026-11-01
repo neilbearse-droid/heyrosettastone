@@ -9,7 +9,9 @@ struct ListenView: View {
     let enterChildMode: () -> Void
 
     @State private var showingSettings = false
-    @State private var liveGuesses: [Suggestion] = []
+    /// The engine's latest answer for the pending chips: guesses, or the
+    /// reason there are none. Nil when nothing is pending.
+    @State private var liveResult: SuggestionResult?
     /// The one in-flight guess refresh; a newer refresh cancels it so stale
     /// guesses never land after fresh ones (D9).
     @State private var guessTask: Task<Void, Never>?
@@ -31,8 +33,8 @@ struct ListenView: View {
                     // meter alone, not this whole tab.
                     LiveLevelMeter()
                         .padding(.horizontal, 48)
-                    if !liveGuesses.isEmpty {
-                        liveGuessStrip
+                    if let liveResult {
+                        liveStrip(liveResult)
                     }
                 } else {
                     Text("Not recording. Tap Listen when you want to start catching his words.")
@@ -101,11 +103,50 @@ struct ListenView: View {
         }
     }
 
-    /// Live top-3 during an exchange (§4.5). Read-only here — resolving
-    /// happens on the Confirm card. Copy stays tentative (§2.6).
-    private var liveGuessStrip: some View {
+    /// The live strip has honest states (§2.6, §7): nothing when no model
+    /// is bundled (Phase 1), a plain note while no word has matured, a
+    /// quiet "nothing resembled" when the model declined on purpose, and
+    /// the top-3 when it has guesses. Read-only here — resolving happens on
+    /// the Confirm card. Copy stays tentative throughout.
+    @ViewBuilder
+    private func liveStrip(_ result: SuggestionResult) -> some View {
+        switch result.reason {
+        case .noModel, .noEmbedding:
+            EmptyView()
+        case .noMatureWords(let total):
+            Text(noMatureWordsText(total: total))
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 48)
+        case .nothingResembled(let checked):
+            if checked > 0 {
+                Text("Didn't sound like any of his \(checked) guessing word\(checked == 1 ? "" : "s")")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 48)
+            }
+        case .suggested:
+            liveGuessStrip(result.suggestions)
+        }
+    }
+
+    /// "N of M words are still learning": N is the words with at least one
+    /// confirmed clip (learning has started), M the dictionary. Progress
+    /// explains the gate; no link here, the tab is one swipe away.
+    private func noMatureWordsText(total: Int) -> String {
+        let learning = env.suggestions.maturityReports.filter { $0.exemplarCount > 0 }.count
+        if learning == 0 {
+            return "No words are guessing yet — they start learning from your first confirmations"
+        }
+        return "No words are guessing yet — \(learning) of \(total) word\(total == 1 ? " is" : "s are") still learning"
+    }
+
+    /// Live top-3 during an exchange (§4.5).
+    private func liveGuessStrip(_ guesses: [Suggestion]) -> some View {
         VStack(spacing: 6) {
-            ForEach(liveGuesses) { guess in
+            ForEach(guesses) { guess in
                 HStack {
                     Text("Maybe: \(guess.intent.label)?")
                         .font(.headline)
@@ -131,7 +172,7 @@ struct ListenView: View {
         guessTask?.cancel()
         let segments = env.capture.recentSegments.filter { $0.segmentState == .pending }
         guard !segments.isEmpty else {
-            liveGuesses = []
+            liveResult = nil
             return
         }
         let station = env.capture.stationName
@@ -139,9 +180,9 @@ struct ListenView: View {
         guessTask = Task {
             // The engine unions in the exchange's own rejections, so a guess
             // dismissed on the Confirm card stays out of this strip too (§2.4).
-            let guesses = await suggestions.suggestions(for: segments, station: station)
+            let result = await suggestions.suggestionsDetailed(for: segments, station: station)
             guard !Task.isCancelled else { return }
-            liveGuesses = guesses
+            liveResult = result
         }
     }
 
@@ -171,9 +212,13 @@ private struct LiveLevelMeter: View {
     @Environment(AppEnvironment.self) private var env
 
     var body: some View {
+        // `confidence` is the neural VAD's speech probability when one is
+        // active (nil on the energy VAD).
+        let level = env.capture.liveLevel
         LevelMeter(
-            rms: env.capture.liveLevel.rms,
-            threshold: env.capture.liveLevel.threshold
+            rms: level.rms,
+            threshold: level.threshold,
+            confidence: level.confidence
         )
     }
 }
@@ -184,6 +229,10 @@ private struct LiveLevelMeter: View {
 struct LevelMeter: View {
     let rms: Float
     let threshold: Float
+    /// Speech probability in 0...1 from a neural VAD, nil when the energy
+    /// detector is judging. With it, the caption reads "Speech: 82%"
+    /// instead of pointing at the dB line.
+    var confidence: Float? = nil
 
     /// Quietest level drawn (dBFS); anything below sits at the left edge.
     private static let floorDB: Float = -70
@@ -217,14 +266,32 @@ struct LevelMeter: View {
                 }
             }
             .frame(height: 10)
-            Text(threshold > 0
-                ? "Mic level — past the line counts as speech"
-                : "Mic level")
+            Text(caption)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+                .monospacedDigit()
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Microphone level")
-        .accessibilityValue(isAbove ? "Hearing speech" : "Quiet")
+        .accessibilityValue(accessibilityValue)
+    }
+
+    private var speechPercent: Int? {
+        guard let confidence else { return nil }
+        return Int((min(max(confidence, 0), 1) * 100).rounded())
+    }
+
+    private var caption: String {
+        if let speechPercent {
+            return "Speech: \(speechPercent)%"
+        }
+        return threshold > 0 ? "Mic level — past the line counts as speech" : "Mic level"
+    }
+
+    private var accessibilityValue: String {
+        if let speechPercent {
+            return "Speech \(speechPercent) percent"
+        }
+        return isAbove ? "Hearing speech" : "Quiet"
     }
 }

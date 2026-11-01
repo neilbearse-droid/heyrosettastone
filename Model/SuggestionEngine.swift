@@ -29,6 +29,86 @@ struct Suggestion: Identifiable, Equatable {
     var confidenceDots: Int { probability > 0.75 ? 3 : probability > 0.5 ? 2 : 1 }
 }
 
+/// A mature word the engine considered for this utterance and chose not to
+/// name, with why. Silence is a deliberate answer (the self-similarity
+/// floor); the surfaces use these to say so instead of looking broken, and
+/// the Confirm path uses them to notice when the floor was too strict.
+struct DeclinedGuess: Identifiable, Equatable {
+    enum Cause: Equatable {
+        /// The utterance resembled this word less than the word's own clips
+        /// resemble each other (`MaturityGate.Report.selfSimilarityFloor`).
+        case underSimilarityFloor
+        /// Cleared the floor but the calibrated probability was under
+        /// `SuggestionEngine.probabilityFloor`.
+        case underProbabilityFloor
+        /// Dismissed this exchange (§2.4) — never scored.
+        case excluded
+    }
+
+    let intentId: String
+    let label: String
+    /// Mean over the exchange's segments of the best raw cosine to the
+    /// word's exemplars (0 when excluded or never a positive match).
+    let bestSimilarity: Double
+    /// The word's self-similarity floor, nil when it has none yet.
+    let floor: Double?
+    let z: Double
+    let probability: Double
+    let cause: Cause
+
+    var id: String { intentId }
+}
+
+/// What the engine has to say about an exchange: the guesses, the mature
+/// words it declined, and the one reason that explains an empty list.
+struct SuggestionResult: Equatable {
+    enum Reason: Equatable {
+        /// No encoder bundled: Phase 1 behaviour, the surfaces show nothing.
+        case noModel
+        /// The model is live but no word has matured yet (§5.6); `total`
+        /// is the number of words in the dictionary.
+        case noMatureWords(total: Int)
+        /// Nothing to rank: no segments, or none could be embedded.
+        case noEmbedding
+        /// `checked` mature words were compared and none resembled the
+        /// utterance (or every one was dismissed: then `checked` is 0).
+        case nothingResembled(checked: Int)
+        case suggested
+    }
+
+    var suggestions: [Suggestion]
+    var declined: [DeclinedGuess]
+    var reason: Reason
+
+    static func empty(_ reason: Reason) -> SuggestionResult {
+        SuggestionResult(suggestions: [], declined: [], reason: reason)
+    }
+}
+
+/// One confirmation that the self-similarity floor would have blocked: the
+/// parent picked from the grid the very word the engine had declined as
+/// not resembling itself enough. Counted, never acted on (§2.2: no silent
+/// self-training); Progress shows the count.
+struct FloorMiss: Equatable {
+    let intentId: String
+    let bestSimilarity: Double
+    let exchangeId: String?
+    let timestamp: Date
+}
+
+extension CalibrationFeature {
+    /// Version-aware comparability check. Prefers the v4 `featureVersion`
+    /// column: equal to `version` → current, another value → stale. A nil
+    /// column (a row that predates v4) falls back to the timestamp cutoff
+    /// in `isCurrent`.
+    static func matchesCurrentVersion(_ observation: CalibrationObservationRecord) -> Bool {
+        if let stored = observation.featureVersion {
+            return stored == version
+        }
+        return isCurrent(observation)
+    }
+}
+
 /// Orchestrates §5: owns the in-memory exemplar index, per-intent
 /// calibrators, context priors, and maturity reports; answers "top-3 for
 /// these segments" for the Confirm card and live parent view. Absent a
@@ -70,6 +150,11 @@ final class SuggestionEngine {
     @ObservationIgnored private var rejectedByExchange: [String: Set<String>] = [:]
     @ObservationIgnored private var rejectedExchangeOrder: [String] = []
     @ObservationIgnored private let rejectedCacheLimit = 32
+
+    /// Confirmations the self-similarity floor would have blocked, newest
+    /// last, bounded. Observable so Progress re-renders when one lands.
+    private(set) var floorMisses: [FloorMiss] = []
+    @ObservationIgnored private let floorMissLimit = 64
 
     /// Apply each word's self-similarity floor (`MaturityGate.Report
     /// .selfSimilarityFloor`) before anything else. Tunable for diagnosis.
@@ -189,8 +274,9 @@ final class SuggestionEngine {
             try CalibrationObservationRecord.fetchAll($0)
         }) ?? []
         // Observations recorded under the previous feature definition are
-        // not comparable; see CalibrationFeature.
-        let observations = allObservations.filter(CalibrationFeature.isCurrent)
+        // not comparable; see CalibrationFeature. The v4 column decides
+        // where present; older rows fall back to the timestamp cutoff.
+        let observations = allObservations.filter(CalibrationFeature.matchesCurrentVersion)
 
         // Decode, then drop vectors whose dimension differs from the modal
         // one (a checkpoint change leaves mixed rows behind; cosine would
@@ -456,14 +542,33 @@ final class SuggestionEngine {
     /// in the segments' exchange (`segments.first?.sessionId`) from the
     /// negatives table — rejection is final (§2.4) whichever surface asks.
     ///
-    /// Each segment is ranked separately and the per-segment standardized
-    /// scores are averaged per intent (§5.2: no prototype averaging, not
-    /// even of the query), with a vote count as tie-break.
+    /// Thin wrapper over `suggestionsDetailed`; surfaces that need to
+    /// explain an empty answer use that directly.
     func suggestions(for segments: [SegmentRecord],
                      station: String,
                      excluding dismissed: Set<String> = [],
                      now: Date = Date()) async -> [Suggestion] {
-        guard isModelAvailable, !index.isEmpty, !suggestibleIntents.isEmpty, !segments.isEmpty else { return [] }
+        await suggestionsDetailed(for: segments, station: station, excluding: dismissed, now: now).suggestions
+    }
+
+    /// The full answer: guesses, every mature word declined and why, and
+    /// the one reason that explains an empty list, so the Listen strip and
+    /// the Confirm card can show that silence is deliberate.
+    ///
+    /// Each segment is ranked separately and the per-segment standardized
+    /// scores are averaged per intent (§5.2: no prototype averaging, not
+    /// even of the query), with a vote count as tie-break. Every mature
+    /// word is accounted for: a word with no positive match to any segment
+    /// is scored as if its similarity were zero and declined like any other.
+    func suggestionsDetailed(for segments: [SegmentRecord],
+                             station: String,
+                             excluding dismissed: Set<String> = [],
+                             now: Date = Date()) async -> SuggestionResult {
+        guard isModelAvailable else { return .empty(.noModel) }
+        guard !index.isEmpty, !suggestibleIntents.isEmpty else {
+            return .empty(.noMatureWords(total: maturityReports.count))
+        }
+        guard !segments.isEmpty else { return .empty(.noEmbedding) }
 
         var excluded = dismissed
         if let exchangeId = segments.first?.sessionId {
@@ -477,31 +582,30 @@ final class SuggestionEngine {
                 if !vector.isEmpty { queries.append(vector) }
             }
         }
-        guard !queries.isEmpty else { return [] }
+        guard !queries.isEmpty else { return .empty(.noEmbedding) }
 
         let index = self.index
         let config = rankerConfig
         var rankings: [IntentRanker.Ranking] = []
-        var seen: Set<String> = []
         var votes: [String: Int] = [:]
         for query in queries {
             let ranking = IntentRanker.rankDetailed(
                 query: query, exemplars: index, excluding: excluded, now: now, config: config
             )
             rankings.append(ranking)
-            for (position, ranked) in ranking.intents.enumerated() {
-                seen.insert(ranked.intentId)
-                if position < 3 { votes[ranked.intentId, default: 0] += 1 }
+            for (position, ranked) in ranking.intents.enumerated() where position < 3 {
+                votes[ranked.intentId, default: 0] += 1
             }
         }
 
-        // Mean of per-segment z; where an intent had no positive match for
-        // a segment it contributes the z of a zero similarity there. The
-        // best raw similarity is averaged the same way (absent → 0) for the
-        // absolute guard below.
+        // Mean of per-segment z over every mature word; where a word had no
+        // positive match for a segment it contributes the z of a zero
+        // similarity there. The best raw similarity is averaged the same
+        // way (absent → 0) for the absolute guard below.
+        let suggestible = self.suggestibleIntents
         var meanZ: [String: Double] = [:]
         var meanBestSimilarity: [String: Double] = [:]
-        for intentId in seen {
+        for intentId in suggestible where !excluded.contains(intentId) {
             var total = 0.0
             var similarityTotal = 0.0
             for ranking in rankings {
@@ -530,34 +634,56 @@ final class SuggestionEngine {
         let similarityFloors = self.similarityFloors
         let usesSimilarityFloor = self.usesSimilarityFloor
 
-        return meanZ
-            .filter { suggestibleIntents.contains($0.key) && !excluded.contains($0.key) }
-            .compactMap { entry -> Suggestion? in
-                let intentId = entry.key
-                let z = entry.value
-                guard let intent = intentById[intentId] else { return nil }
-                // Absolute guard first: the utterance must resemble this
-                // word at least as much as the word's own clips resemble
-                // each other across exchanges. Relative ranking always has
-                // a leader; this is what lets the answer be "nothing".
-                let bestSimilarity = meanBestSimilarity[intentId] ?? 0
-                if usesSimilarityFloor, let wordFloor = similarityFloors[intentId], bestSimilarity < wordFloor {
-                    return nil
-                }
-                let calibrator = calibrators[intentId] ?? .uncalibrated
-                let probability = calibrator.probability(of: z)
-                guard probability >= floor else { return nil }
-                let prior = priors?.prior(for: intentId, context: context) ?? 1
-                return Suggestion(
-                    intent: intent,
-                    rawScore: z,
-                    probability: probability,
-                    prior: prior,
-                    rankingScore: probability * prior,
-                    votes: votes[intentId] ?? 0,
-                    bestSimilarity: bestSimilarity
-                )
+        var candidates: [Suggestion] = []
+        var declined: [DeclinedGuess] = []
+        var checked = 0
+        // Sorted so the declined list (and any tie-break) is deterministic.
+        for intentId in suggestible.sorted() {
+            guard let intent = intentById[intentId] else { continue }
+            let wordFloor = similarityFloors[intentId]
+            if excluded.contains(intentId) {
+                declined.append(DeclinedGuess(
+                    intentId: intentId, label: intent.label, bestSimilarity: 0,
+                    floor: wordFloor, z: 0, probability: 0, cause: .excluded
+                ))
+                continue
             }
+            checked += 1
+            let z = meanZ[intentId] ?? 0
+            let bestSimilarity = meanBestSimilarity[intentId] ?? 0
+            let calibrator = calibrators[intentId] ?? .uncalibrated
+            let probability = calibrator.probability(of: z)
+            // Absolute guard first: the utterance must resemble this word
+            // at least as much as the word's own clips resemble each other
+            // across exchanges. Relative ranking always has a leader; this
+            // is what lets the answer be "nothing".
+            if usesSimilarityFloor, let wordFloor, bestSimilarity < wordFloor {
+                declined.append(DeclinedGuess(
+                    intentId: intentId, label: intent.label, bestSimilarity: bestSimilarity,
+                    floor: wordFloor, z: z, probability: probability, cause: .underSimilarityFloor
+                ))
+                continue
+            }
+            guard probability >= floor else {
+                declined.append(DeclinedGuess(
+                    intentId: intentId, label: intent.label, bestSimilarity: bestSimilarity,
+                    floor: wordFloor, z: z, probability: probability, cause: .underProbabilityFloor
+                ))
+                continue
+            }
+            let prior = priors?.prior(for: intentId, context: context) ?? 1
+            candidates.append(Suggestion(
+                intent: intent,
+                rawScore: z,
+                probability: probability,
+                prior: prior,
+                rankingScore: probability * prior,
+                votes: votes[intentId] ?? 0,
+                bestSimilarity: bestSimilarity
+            ))
+        }
+
+        let top3 = candidates
             .sorted { lhs, rhs in
                 if lhs.rankingScore != rhs.rankingScore { return lhs.rankingScore > rhs.rankingScore }
                 if lhs.votes != rhs.votes { return lhs.votes > rhs.votes }
@@ -565,6 +691,42 @@ final class SuggestionEngine {
             }
             .prefix(3)
             .map { $0 }
+
+        return SuggestionResult(
+            suggestions: top3,
+            declined: declined,
+            reason: top3.isEmpty ? .nothingResembled(checked: checked) : .suggested
+        )
+    }
+
+    // MARK: - Floor misses
+
+    /// The parent confirmed, from the grid, a word the engine had declined
+    /// under its self-similarity floor: his way of saying it varied more
+    /// than the model expected. Counted here (bounded, in memory, once per
+    /// exchange and word) and surfaced in Progress. Never loosens the
+    /// floor by itself (§2.2): the confirmation that triggered it is the
+    /// new exemplar, and the next maturity pass widens the floor from it.
+    func noteFloorMiss(intentId: String,
+                       bestSimilarity: Double,
+                       exchangeId: String?,
+                       now: Date = Date()) {
+        if let exchangeId,
+           floorMisses.contains(where: { $0.intentId == intentId && $0.exchangeId == exchangeId }) {
+            return
+        }
+        floorMisses.append(FloorMiss(
+            intentId: intentId, bestSimilarity: bestSimilarity, exchangeId: exchangeId, timestamp: now
+        ))
+        while floorMisses.count > floorMissLimit {
+            floorMisses.removeFirst()
+        }
+    }
+
+    /// How many times this word was confirmed after being declined under
+    /// its floor (since launch).
+    func floorMisses(for intentId: String) -> Int {
+        floorMisses.filter { $0.intentId == intentId }.count
     }
 
     // MARK: - Outcomes
@@ -583,7 +745,9 @@ final class SuggestionEngine {
             intentId: intentId,
             score: rawScore,
             accepted: accepted,
-            timestamp: now
+            timestamp: now,
+            exchangeId: exchangeId,
+            featureVersion: CalibrationFeature.version
         ))
         if !accepted {
             noteDismissal(intentId: intentId, exchangeId: exchangeId)
@@ -606,7 +770,9 @@ final class SuggestionEngine {
                 intentId: guess.intent.id,
                 score: guess.rawScore,
                 accepted: guess.intent.id == confirmedIntentId,
-                timestamp: now
+                timestamp: now,
+                exchangeId: exchangeId,
+                featureVersion: CalibrationFeature.version
             )
         }
         try? db.dbQueue.write { db in
@@ -621,7 +787,7 @@ final class SuggestionEngine {
 
     private func refitCalibrator(intentId: String) {
         let history = ((try? CalibrationStore(db: db).observations(intentId: intentId)) ?? [])
-            .filter(CalibrationFeature.isCurrent)
+            .filter(CalibrationFeature.matchesCurrentVersion)
             .map { (score: $0.score, accepted: $0.accepted) }
         calibrators[intentId] = LogisticCalibrator.fit(observations: history)
     }

@@ -322,6 +322,171 @@ final class SuggestionEngineTests: XCTestCase {
             XCTAssertEqual(row?.score ?? .nan, guess.rawScore, accuracy: 1e-9,
                            "the stored feature is the z the guess was shown with")
             XCTAssertTrue(CalibrationFeature.isCurrent(row!))
+            XCTAssertEqual(row?.exchangeId, exchange, "v4: the row remembers the exchange it was shown in")
+            XCTAssertEqual(row?.featureVersion, CalibrationFeature.version)
+            XCTAssertTrue(CalibrationFeature.matchesCurrentVersion(row!))
+        }
+    }
+
+    func testFeatureVersionColumnWinsOverTheTimestampCutoff() {
+        let stale = CalibrationObservationRecord(
+            intentId: "x", score: 1.0, accepted: true,
+            timestamp: CalibrationFeature.versionCutoff.addingTimeInterval(3600),
+            featureVersion: CalibrationFeature.version - 1
+        )
+        XCTAssertFalse(CalibrationFeature.matchesCurrentVersion(stale),
+                       "an explicit old version is stale however recent the timestamp")
+        let legacy = CalibrationObservationRecord(
+            intentId: "x", score: 1.0, accepted: true,
+            timestamp: CalibrationFeature.versionCutoff.addingTimeInterval(-1)
+        )
+        XCTAssertFalse(CalibrationFeature.matchesCurrentVersion(legacy), "nil column: the cutoff decides")
+        let legacyCurrent = CalibrationObservationRecord(
+            intentId: "x", score: 1.0, accepted: true,
+            timestamp: CalibrationFeature.versionCutoff
+        )
+        XCTAssertTrue(CalibrationFeature.matchesCurrentVersion(legacyCurrent))
+    }
+
+    // MARK: - Detailed result: every silence has a reason
+
+    func testDetailedReasonIsNoModelWithoutAnEncoder() async throws {
+        try seedMatureDictionary()
+        let silent = SuggestionEngine(db: db, embedder: nil)
+        await silent.reload()
+        let available = await silent.isModelAvailable
+        XCTAssertFalse(available)
+
+        let result = await silent.suggestionsDetailed(for: [querySegment()], station: station, now: queryNow)
+        XCTAssertEqual(result.reason, .noModel, "Phase 1 behaviour: the surfaces show nothing at all")
+        XCTAssertTrue(result.suggestions.isEmpty)
+        XCTAssertTrue(result.declined.isEmpty)
+    }
+
+    func testDetailedReasonIsNoMatureWordsBeforeAnyWordClearsTheGate() async throws {
+        // One exchange of banana: clips, but no word is mature.
+        try confirmSession(
+            id: "banana-only", intent: banana, vectors: Array(cluster(axis: 0).prefix(2)),
+            capturedAt: localDate(hour: 9), confirmedAt: localDate(hour: 20)
+        )
+        await engine.reload()
+        let suggestible = await engine.suggestibleIntentIds
+        XCTAssertTrue(suggestible.isEmpty)
+
+        let result = await engine.suggestionsDetailed(for: [querySegment()], station: station, now: queryNow)
+        XCTAssertEqual(result.reason, .noMatureWords(total: 4), "total is the whole dictionary")
+        XCTAssertTrue(result.suggestions.isEmpty)
+        let reports = await engine.maturityReports
+        XCTAssertEqual(reports.filter { $0.exemplarCount > 0 }.count, 1, "what Listen phrases as 1 of 4 still learning")
+    }
+
+    func testDetailedReasonIsNoEmbeddingWhenNoChipCanBeEncoded() async throws {
+        try seedMatureDictionary()
+        await engine.reload()
+
+        let noAudio = SegmentRecord(
+            id: "ghost", sessionId: exchange, clipRef: "ghost-clip",
+            startedAt: queryNow, durationMs: 500, embedding: nil
+        )
+        let result = await engine.suggestionsDetailed(for: [noAudio], station: station, now: queryNow)
+        XCTAssertEqual(result.reason, .noEmbedding)
+        XCTAssertEqual(embedder.calls, 0, "no clip on disk: nothing to encode")
+
+        let none = await engine.suggestionsDetailed(for: [], station: station, now: queryNow)
+        XCTAssertEqual(none.reason, .noEmbedding, "no chips: nothing to rank")
+    }
+
+    /// The Football / Chase moment, in full: one mature word, an unrelated
+    /// utterance, and the answer is a deliberate, explained "nothing".
+    func testOneWordDictionaryDeclinesWithAReasonAndADeclinedEntry() async throws {
+        try seed(intent: banana, vectors: cluster(axis: 0), capturedHour: 9)
+        await engine.reload()
+
+        let unrelated = EmbeddingFixtures.near(5, leaning: 6, by: 0.2)
+        let result = await engine.suggestionsDetailed(
+            for: [querySegment(id: "chase", vector: unrelated)], station: station, now: queryNow
+        )
+        XCTAssertEqual(result.reason, .nothingResembled(checked: 1))
+        XCTAssertTrue(result.suggestions.isEmpty)
+        XCTAssertEqual(result.declined.count, 1)
+        let declined = try XCTUnwrap(result.declined.first)
+        XCTAssertEqual(declined.intentId, banana.id)
+        XCTAssertEqual(declined.label, "banana")
+        XCTAssertEqual(declined.cause, .underSimilarityFloor)
+        let floor = try XCTUnwrap(declined.floor)
+        XCTAssertEqual(floor, clusterFloor, accuracy: 1e-4)
+        XCTAssertLessThan(declined.bestSimilarity, floor)
+        XCTAssertGreaterThan(declined.bestSimilarity, 0.3, "it did lean toward banana a little — just not enough")
+
+        // The wrapper is the same answer, shortened.
+        let plain = await engine.suggestions(
+            for: [querySegment(id: "chase2", vector: unrelated)], station: station, now: queryNow
+        )
+        XCTAssertEqual(plain, result.suggestions)
+    }
+
+    func testDetailedResultListsDeclinedMatureWordsAlongsideTheGuesses() async throws {
+        try seedMatureDictionary()
+        await engine.reload()
+
+        let result = await engine.suggestionsDetailed(for: [querySegment()], station: station, now: queryNow)
+        XCTAssertEqual(result.reason, .suggested)
+        XCTAssertEqual(result.suggestions.map(\.intent.id), [banana.id, water.id, outside.id])
+        XCTAssertEqual(result.declined.map(\.intentId), [help.id],
+                       "help is mature but the utterance does not resemble it")
+        XCTAssertEqual(result.declined.first?.cause, .underSimilarityFloor)
+        let helpFloor = try XCTUnwrap(result.declined.first?.floor)
+        XCTAssertLessThan(result.declined.first?.bestSimilarity ?? 1, helpFloor)
+
+        // A dismissed word is declined as excluded, never scored.
+        let afterNo = await engine.suggestionsDetailed(
+            for: [querySegment(id: "q2")], station: station, excluding: [banana.id], now: queryNow
+        )
+        XCTAssertEqual(afterNo.suggestions.map(\.intent.id), [water.id, outside.id])
+        let excluded = try XCTUnwrap(afterNo.declined.first { $0.intentId == banana.id })
+        XCTAssertEqual(excluded.cause, .excluded)
+        XCTAssertEqual(afterNo.declined.count, 2, "banana excluded, help under its floor")
+    }
+
+    func testEveryMatureWordDismissedIsNothingResembledWithZeroChecked() async throws {
+        try seed(intent: banana, vectors: cluster(axis: 0), capturedHour: 9)
+        await engine.reload()
+        let result = await engine.suggestionsDetailed(
+            for: [querySegment()], station: station, excluding: [banana.id], now: queryNow
+        )
+        XCTAssertEqual(result.reason, .nothingResembled(checked: 0),
+                       "the surfaces must not say \"none of his words sounded like this\" when the parent dismissed them all")
+        XCTAssertEqual(result.declined.map(\.cause), [.excluded])
+    }
+
+    // MARK: - Floor misses
+
+    func testFloorMissesAreCountedOncePerExchangeAndWord() async {
+        await MainActor.run {
+            XCTAssertEqual(engine.floorMisses(for: banana.id), 0)
+            engine.noteFloorMiss(intentId: banana.id, bestSimilarity: 0.6, exchangeId: "ex-1", now: queryNow)
+            engine.noteFloorMiss(intentId: banana.id, bestSimilarity: 0.6, exchangeId: "ex-1", now: queryNow)
+            XCTAssertEqual(engine.floorMisses(for: banana.id), 1, "a double report for one exchange is one miss")
+            engine.noteFloorMiss(intentId: banana.id, bestSimilarity: 0.55, exchangeId: "ex-2", now: queryNow)
+            engine.noteFloorMiss(intentId: water.id, bestSimilarity: 0.5, exchangeId: "ex-2", now: queryNow)
+            XCTAssertEqual(engine.floorMisses(for: banana.id), 2)
+            XCTAssertEqual(engine.floorMisses(for: water.id), 1)
+            XCTAssertEqual(engine.floorMisses(for: outside.id), 0)
+            // No exchange id: nothing to de-duplicate on, every report counts.
+            engine.noteFloorMiss(intentId: outside.id, bestSimilarity: 0.4, exchangeId: nil, now: queryNow)
+            engine.noteFloorMiss(intentId: outside.id, bestSimilarity: 0.4, exchangeId: nil, now: queryNow)
+            XCTAssertEqual(engine.floorMisses(for: outside.id), 2)
+            XCTAssertEqual(engine.floorMisses.last?.bestSimilarity, 0.4)
+        }
+    }
+
+    func testFloorMissRingIsBounded() async {
+        await MainActor.run {
+            for i in 0..<200 {
+                engine.noteFloorMiss(intentId: banana.id, bestSimilarity: 0.5, exchangeId: "ex-\(i)", now: queryNow)
+            }
+            XCTAssertLessThanOrEqual(engine.floorMisses.count, 64)
+            XCTAssertEqual(engine.floorMisses.last?.exchangeId, "ex-199", "newest kept, oldest dropped")
         }
     }
 

@@ -159,6 +159,22 @@ final class AppDatabase {
             try db.create(index: "negatives_intent", on: "negatives", columns: ["rejectedIntentId"])
         }
 
+        // v4: a shown-guess observation remembers which exchange it was
+        // shown in and which feature definition scored it. The exchange id
+        // lets Progress measure the Phase 2 acceptance criterion in-app
+        // (was his word among the guesses at the yes moment?); the version
+        // lets a feature change retire old rows exactly instead of by
+        // timestamp. Nullable, no back-fill: rows that predate v4 keep
+        // falling back to `CalibrationFeature.versionCutoff`.
+        migrator.registerMigration("v4-outcome-context") { db in
+            try db.alter(table: "calibrationObservations") { t in
+                t.add(column: "exchangeId", .text)
+                t.add(column: "featureVersion", .integer)
+            }
+            try db.create(index: "calibration_exchange", on: "calibrationObservations", columns: ["exchangeId"])
+            try db.create(index: "negatives_exchange", on: "negatives", columns: ["exchangeId"])
+        }
+
         return migrator
     }
 }

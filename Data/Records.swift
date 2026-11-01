@@ -302,16 +302,28 @@ struct CalibrationObservationRecord: Codable, Identifiable, Equatable, Fetchable
     var score: Double
     var accepted: Bool
     var timestamp: Date
+    /// The exchange the guess was shown in (v4). Groups the observations of
+    /// one yes moment so `LiveAccuracy` can ask "was his word among the
+    /// guesses, and was it first?". Nil for rows that predate v4.
+    var exchangeId: String?
+    /// `CalibrationFeature.version` the score was produced under (v4), so
+    /// a change of feature definition can retire old rows exactly rather
+    /// than by timestamp. Nil for rows that predate v4.
+    var featureVersion: Int?
 
     init(id: String = UUID().uuidString,
          intentId: String,
          score: Double,
          accepted: Bool,
-         timestamp: Date = Date()) {
+         timestamp: Date = Date(),
+         exchangeId: String? = nil,
+         featureVersion: Int? = nil) {
         self.id = id
         self.intentId = intentId
         self.score = score
         self.accepted = accepted
         self.timestamp = timestamp
+        self.exchangeId = exchangeId
+        self.featureVersion = featureVersion
     }
 }

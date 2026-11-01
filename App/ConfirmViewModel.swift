@@ -36,6 +36,13 @@ final class ConfirmViewModel {
     /// The ranker's latest top-3 for the selected chips, set by the view
     /// after each refresh. What is actually shown is `displayedGuesses`.
     var topGuesses: [Suggestion] = []
+    /// The mature words the engine declined for the selected chips, with
+    /// why, from the same refresh as `topGuesses`.
+    var declinedGuesses: [DeclinedGuess] = []
+    /// Why the engine answered as it did on the last refresh; nil until the
+    /// first refresh lands. The card uses it to say that an empty guess
+    /// list was deliberate.
+    var suggestionReason: SuggestionResult.Reason?
 
     /// The yes moment with guesses on screen: called with every guess that
     /// was showing, the intent chosen, and the exchange id, so the engine
@@ -43,6 +50,14 @@ final class ConfirmViewModel {
     /// by the view to `SuggestionEngine.recordOutcomes`.
     @ObservationIgnored
     var outcomeRecorder: ((_ shown: [Suggestion], _ confirmedIntentId: String, _ exchangeId: String?) -> Void)?
+
+    /// The confirmed word was one the engine had declined under its
+    /// self-similarity floor: his way of saying it varied more than the
+    /// model expected. Called once per such confirmation with the
+    /// similarity the engine saw, so the engine can count it (never act on
+    /// it, §2.2). Wired by the view to `SuggestionEngine.noteFloorMiss`.
+    @ObservationIgnored
+    var floorMissRecorder: ((_ intentId: String, _ bestSimilarity: Double, _ exchangeId: String?) -> Void)?
 
     init(segments: [SegmentRecord],
          exchangeId: String?,
@@ -232,6 +247,11 @@ final class ConfirmViewModel {
             timestamp: now
         ))
         outcomeRecorder?(shown, intentId, exchangeId)
+        // The floor said "this is not football" and the parent said it was:
+        // valuable signal that the floor was too strict for his variability.
+        if let miss = declinedGuesses.first(where: { $0.intentId == intentId && $0.cause == .underSimilarityFloor }) {
+            floorMissRecorder?(miss.intentId, miss.bestSimilarity, exchangeId)
+        }
         resolved = true
         return created
     }
