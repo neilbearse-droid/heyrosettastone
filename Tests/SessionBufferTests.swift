@@ -205,6 +205,34 @@ final class SessionBufferTests: XCTestCase {
         XCTAssertLessThan(tailPeak, 0.01, "and should be the quiet tail, not the vowel")
     }
 
+    func testMutedChunksAdvanceTheClockWithoutTrainingTheDetector() {
+        // The board speaks mid-exchange. Capture feeds zeros flagged muted:
+        // the open utterance must still end, the session must still close
+        // on time, but the detector must not learn "the room is silent"
+        // from synthetic zeros and come back hair-trigger.
+        let recorder = BufferRecorder()
+        let buffer = makeBuffer(recorder: recorder)
+        buffer.ingest(AudioFixtures.tone(seconds: 1.0))
+        let thresholdAfterSpeech = buffer.liveLevel.threshold
+
+        buffer.ingest(AudioFixtures.silence(seconds: 1.0), muted: true)
+        XCTAssertEqual(buffer.streamTime, 2.0, accuracy: 0.001, "muted audio still advances the clock")
+        XCTAssertEqual(recorder.segments.count, 1, "the utterance ends through the normal hangover")
+        XCTAssertEqual(recorder.segments[0].duration, 1.3, accuracy: 0.3)
+        XCTAssertEqual(buffer.liveLevel.threshold, thresholdAfterSpeech,
+                       "the detector was neither consulted nor trained while muted")
+
+        buffer.ingest(AudioFixtures.silence(seconds: 10.0), muted: true)
+        XCTAssertEqual(recorder.closes.count, 1, "the 10 s silence close still fires on muted time")
+        XCTAssertEqual(recorder.closes[0].reason, .silence)
+
+        // Control: the same zeros unmuted collapse the floor.
+        let control = makeBuffer(recorder: BufferRecorder())
+        control.ingest(AudioFixtures.tone(seconds: 1.0))
+        control.ingest(AudioFixtures.silence(seconds: 1.0))
+        XCTAssertLessThan(control.liveLevel.threshold, thresholdAfterSpeech)
+    }
+
     func testLabelAttachesToCorrectSegments() throws {
         // End-to-end stamping: buffer output → database rows → confirm →
         // exemplars carry exactly the selected segments' clips.

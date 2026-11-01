@@ -65,9 +65,10 @@ final class SuggestionEngine {
     @ObservationIgnored private let rejectedCacheLimit = 32
 
     /// Skip guesses whose calibrated acoustic probability is below this.
-    /// On the uncalibrated default (slope 1.5, intercept −1) this filters
-    /// intents whose best match sits more than ~0.5 std below the mean
-    /// similarity of the store.
+    /// On the uncalibrated default (slope 1, intercept −1.5) this filters
+    /// intents whose best match sits more than ~0.23 std below the mean
+    /// similarity of the store — a word none of whose exemplars resembles
+    /// the query more than the average exemplar does.
     @ObservationIgnored var probabilityFloor = 0.15
     /// Tunables. `maturityConfig.ranker` is kept in step with `rankerConfig`.
     @ObservationIgnored var rankerConfig = IntentRanker.Config()

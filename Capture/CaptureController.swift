@@ -192,18 +192,40 @@ final class CaptureController: SessionBufferDelegate {
         recentSegments = []
     }
 
+    /// Re-reads the rows behind `recentSegments` so a chip labelled,
+    /// discarded or marked "not him" somewhere else (Review) stops
+    /// counting as pending on the Confirm badge, Listen's "clips waiting"
+    /// and the live guesses. Call after any Review action while a session
+    /// is live or recent. Rows that no longer exist (wipe) drop out; an
+    /// embedding already held in memory is kept when the row has none yet.
+    /// Main actor; one small read.
+    func refreshSegmentStates() {
+        let ids = recentSegments.map(\.id)
+        guard !ids.isEmpty else { return }
+        guard let rows = try? SegmentStore(db: db).fetch(ids: ids) else { return }
+        let fresh = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, $0) })
+        recentSegments = recentSegments.compactMap { held -> SegmentRecord? in
+            guard var row = fresh[held.id] else { return nil }
+            if row.embedding == nil { row.embedding = held.embedding }
+            return row
+        }
+    }
+
     // MARK: - Capture queue: chunk handling
 
     private func handleChunk(_ chunk: AudioCaptureEngine.Chunk, speech: SpeechOutput) {
         var samples = chunk.samples
         // While the board is talking, the microphone hears the phone, not
-        // the child. Feed silence of the same length so the session clock
-        // still advances (and a session still closes on time) without the
-        // synthesizer's voice ever becoming a segment.
-        if chunk.receivedAt < speech.selfSpeakingUntil {
+        // the child. Feed silence of the same length, flagged muted, so the
+        // session clock still advances (and a session still closes on
+        // time) without the synthesizer's voice ever becoming a segment
+        // and without the detector learning "the room is silent" from
+        // synthetic zeros (SessionBuffer.ingest(_:receivedAt:muted:)).
+        let muted = chunk.receivedAt < speech.selfSpeakingUntil
+        if muted {
             samples = [Float](repeating: 0, count: samples.count)
         }
-        buffer.ingest(samples, receivedAt: chunk.receivedAt)
+        buffer.ingest(samples, receivedAt: chunk.receivedAt, muted: muted)
         publishLevelIfDue(now: chunk.receivedAt)
         checkDiskIfDue(now: chunk.receivedAt)
     }
@@ -235,6 +257,10 @@ final class CaptureController: SessionBufferDelegate {
         buffer.interrupt()
         let message = "Listening stopped: \(reason). It will resume on its own if the phone gives the microphone back; otherwise tap Listen."
         Task { @MainActor in
+            // The engine is the truth: if a tap on Listen (or an automatic
+            // resume) already brought it back before this ran, this stale
+            // notice must not turn a running station amber.
+            guard !self.engine.isRunning else { return }
             self.isListening = false
             self.liveLevel = (0, 0)
             self.lastError = message
@@ -252,6 +278,10 @@ final class CaptureController: SessionBufferDelegate {
         streamStartDate = Date()
         lastLevelPublish = .distantPast
         Task { @MainActor in
+            // If the parent tapped Pause in the instant between the resume
+            // and this hop, the engine is stopped again and the indicator
+            // must stay off: never show green with the engine stopped.
+            guard self.engine.isRunning else { return }
             self.isListening = true
             self.lastError = nil
             self.setIdleTimerDisabled(true)
@@ -312,14 +342,17 @@ final class CaptureController: SessionBufferDelegate {
             return
         }
         // Abandoned-exchange bookkeeping (§2.9): if the exchange this one
-        // displaces still has unlabelled segments, nobody got to the yes
-        // moment on the card. Log the marker (EventLog.exchangeOutcomes is
-        // the source of truth), then sweep Review expiry so the card and
-        // live guesses never operate on stale segments. Both are
-        // best-effort: a failed write here must not stop listening.
+        // displaces still has unlabelled segments and nobody confirmed it
+        // (a deselected sibling chip left pending after a confirm is not
+        // an abandoned exchange), nobody got to the yes moment on the
+        // card. Log the marker (EventLog.exchangeOutcomes is the source of
+        // truth), then sweep Review expiry so the card and live guesses
+        // never operate on stale segments. Both are best-effort: a failed
+        // write here must not stop listening.
         if let previous = queueLastSessionId, previous != id {
             let previousSegments = (try? sessions.segments(sessionId: previous)) ?? []
-            if previousSegments.contains(where: { $0.segmentState == .pending }) {
+            let resolved = (try? events.hasResolution(exchangeId: previous)) ?? false
+            if !resolved, previousSegments.contains(where: { $0.segmentState == .pending }) {
                 try? events.log(EventRecord(
                     exchangeId: previous,
                     type: .abandon,

@@ -269,6 +269,44 @@ final class DataLayerTests: XCTestCase {
         XCTAssertEqual(outcomes.abandoned, 0)
     }
 
+    func testAbandonedRateTreatsHisBoardTapAsResolvedAndIgnoresSessionsThatWereNotHim() throws {
+        let banana = IntentRecord(label: "banana")
+        try IntentStore(db: db).insert(banana)
+        let twoDaysAgo = now.addingTimeInterval(-2 * 24 * 3600)
+
+        // He walked to the board and tapped banana mid-exchange; nobody
+        // confirmed on the card and the chip expired. Understanding was
+        // reached through his AAC: resolved.
+        try addSession(id: "tap", startedAt: twoDaysAgo, endedAt: twoDaysAgo.addingTimeInterval(30))
+        try addSegment(id: "gt", sessionId: "tap", startedAt: twoDaysAgo, state: .expired, withClip: false)
+        try EventLog(db: db).log(EventRecord(
+            exchangeId: "tap", type: .boardTap, intentId: banana.id, device: "Kitchen",
+            timestamp: twoDaysAgo.addingTimeInterval(10)))
+
+        // The TV, discarded in Review; his sister, marked not him. Neither
+        // was an exchange with him, so neither counts on either side.
+        try addSession(id: "tv", startedAt: twoDaysAgo.addingTimeInterval(600))
+        try addSegment(id: "g-tv", sessionId: "tv", startedAt: twoDaysAgo.addingTimeInterval(600),
+                       state: .discarded, labelledAt: twoDaysAgo.addingTimeInterval(7200), withClip: false)
+        try addSession(id: "sis", startedAt: twoDaysAgo.addingTimeInterval(1200))
+        try addSegment(id: "g-sis", sessionId: "sis", startedAt: twoDaysAgo.addingTimeInterval(1200),
+                       state: .notHim, labelledAt: twoDaysAgo.addingTimeInterval(7200), withClip: false)
+
+        // Labelled only after the 24 h window (the sweep had not run): abandoned.
+        try addSession(id: "late", startedAt: twoDaysAgo.addingTimeInterval(1800))
+        try addSegment(id: "g-late", sessionId: "late", startedAt: twoDaysAgo.addingTimeInterval(1800),
+                       state: .labelled, labelledAt: twoDaysAgo.addingTimeInterval(26 * 3600), withClip: false)
+
+        let log = EventLog(db: db)
+        let since = now.addingTimeInterval(-7 * 24 * 3600)
+        XCTAssertTrue(try log.hasResolution(exchangeId: "tap"))
+        XCTAssertFalse(try log.hasResolution(exchangeId: "late"))
+        let outcomes = try log.exchangeOutcomes(since: since, now: now)
+        XCTAssertEqual(outcomes.resolved, 1)
+        XCTAssertEqual(outcomes.abandoned, 1)
+        XCTAssertEqual(try XCTUnwrap(log.abandonedRate(since: since, now: now)), 0.5, accuracy: 1e-9)
+    }
+
     func testAbandonedRateIsNilWithNoSessions() throws {
         XCTAssertNil(try EventLog(db: db).abandonedRate(since: now.addingTimeInterval(-86_400), now: now))
     }
@@ -366,6 +404,41 @@ final class DataLayerTests: XCTestCase {
         XCTAssertEqual(again.rowsInserted, 0)
         XCTAssertEqual(again.clipsCopied, 0)
         XCTAssertEqual(try counts(), before)
+    }
+
+    func testImportMovesCollidingBoardSlotsToFreeOnesWithoutTouchingLocalButtons() throws {
+        // This phone: water on slot 0, outside on slot 2 (slot 1 is a gap).
+        let water = IntentRecord(label: "water", boardSlot: 0)
+        let outside = IntentRecord(label: "outside", boardSlot: 2)
+        try IntentStore(db: db).insert(water)
+        try IntentStore(db: db).insert(outside)
+
+        // The other phone's export: banana on slot 0 (collides with water),
+        // juice on slot 1 (free here, but banana will take it first), water
+        // itself (same id, slot 3 there), and an archived word.
+        var exportedWater = water
+        exportedWater.boardSlot = 3
+        let banana = IntentRecord(label: "banana", boardSlot: 0)
+        let juice = IntentRecord(label: "juice", boardSlot: 1)
+        let old = IntentRecord(label: "old", boardSlot: 5, archivedAt: now)
+        let manifest = RosettaExporter.ExportManifest(
+            exportedAt: now, intents: [banana, juice, exportedWater, old],
+            exemplars: [], negatives: [], events: [], sessions: [], segments: [])
+
+        let summary = try RosettaImporter.mergeRows(manifest, into: db)
+        XCTAssertEqual(summary.intents, 3)
+        XCTAssertEqual(summary.skippedRows, 0)
+
+        let slots = Dictionary(uniqueKeysWithValues: try IntentStore(db: db).all(includeArchived: true).map { ($0.id, $0.boardSlot) })
+        XCTAssertEqual(slots[water.id], 0, "a local button never moves (§2.3), even if the export had it elsewhere")
+        XCTAssertEqual(slots[outside.id], 2)
+        XCTAssertEqual(slots[banana.id], 1, "collided with water: lowest free slot")
+        XCTAssertEqual(slots[juice.id], 3, "its slot went to banana a moment earlier: next free slot")
+        XCTAssertEqual(slots[old.id], .some(nil), "archived words hold no slot")
+
+        // Every placed button renders in its own cell; nothing was dropped.
+        let cells = BoardLayout.cells(for: try IntentStore(db: db).all())
+        XCTAssertEqual(cells.compactMap { $0?.label }, ["water", "banana", "outside", "juice"])
     }
 
     func testImportAcceptsManifestFileAndWrapperFolder() throws {

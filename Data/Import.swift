@@ -131,12 +131,20 @@ enum RosettaImporter {
     /// `INSERT OR IGNORE` by primary key; a row the database still refuses
     /// (for example a segment whose session is absent from the export) is
     /// counted in `skippedRows` and the import continues.
+    ///
+    /// Board slots are unique. An imported intent whose slot is already
+    /// taken by a different intent on this phone is placed on the lowest
+    /// free slot instead (`BoardLayout.slotForNewIntent`): his existing
+    /// buttons never move (§2.3), and the imported word still reaches his
+    /// board rather than being dropped by the uniqueness constraint or
+    /// overwriting a cell.
     static func mergeRows(_ manifest: RosettaExporter.ExportManifest, into db: AppDatabase) throws -> ImportSummary {
         try db.dbQueue.write { db in
             var summary = ImportSummary()
             var skipped = 0
 
-            summary.intents = Self.insertIgnoring(manifest.intents, db, skipped: &skipped)
+            let intents = try Self.resolvingBoardSlots(manifest.intents, db)
+            summary.intents = Self.insertIgnoring(intents, db, skipped: &skipped)
             summary.sessions = Self.insertIgnoring(manifest.sessions, db, skipped: &skipped)
             summary.segments = Self.insertIgnoring(manifest.segments, db, skipped: &skipped)
             summary.exemplars = Self.insertIgnoring(manifest.exemplars, db, skipped: &skipped)
@@ -147,6 +155,32 @@ enum RosettaImporter {
 
             summary.skippedRows = skipped
             return summary
+        }
+    }
+
+    /// Imported intents with their board slots made consistent with this
+    /// phone's board: an intent already present keeps the local row (its
+    /// slot is irrelevant, the insert is ignored); a new intent whose slot
+    /// is occupied by another id, locally or earlier in this import, moves
+    /// to the lowest free slot. Archived intents hold no slot.
+    static func resolvingBoardSlots(_ incoming: [IntentRecord], _ db: Database) throws -> [IntentRecord] {
+        let existingIds = Set(try String.fetchAll(db, sql: "SELECT id FROM intents"))
+        var occupied: [Int: String] = [:]
+        for row in try Row.fetchAll(db, sql: "SELECT id, boardSlot FROM intents WHERE boardSlot IS NOT NULL") {
+            if let id: String = row["id"], let slot: Int = row["boardSlot"] { occupied[slot] = id }
+        }
+        return incoming.map { intent in
+            guard !existingIds.contains(intent.id), let slot = intent.boardSlot else { return intent }
+            var placed = intent
+            if placed.archivedAt != nil {
+                placed.boardSlot = nil
+                return placed
+            }
+            if let holder = occupied[slot], holder != intent.id {
+                placed.boardSlot = BoardLayout.slotForNewIntent(occupiedSlots: Array(occupied.keys))
+            }
+            if let final = placed.boardSlot { occupied[final] = intent.id }
+            return placed
         }
     }
 

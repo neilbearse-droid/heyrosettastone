@@ -45,10 +45,18 @@ struct LogisticCalibrator: Equatable {
     var slope: Double
     var intercept: Double
 
-    /// Uncalibrated default on the z scale: p(z = 0) ≈ 0.27 (an intent whose
-    /// best match merely equals the mean similarity is probably wrong),
-    /// p(z = 2) ≈ 0.88. Used until an intent has enough of its own history.
-    static let uncalibrated = LogisticCalibrator(slope: 1.5, intercept: -1.0)
+    /// Uncalibrated default on the z scale, used until an intent has enough
+    /// of its own history. z is "standard deviations above the mean
+    /// similarity of the index", and the best match in an index of N
+    /// exemplars sits at roughly z ≈ 1.5-3 by construction (the maximum of
+    /// N draws) whether or not the query is really that word, so the
+    /// default must not hand three confidence dots to every leader. With
+    /// slope 1 / intercept −1.5: p(0) ≈ 0.18 (a best match merely at the
+    /// mean is probably wrong and falls under the engine's 0.15 floor
+    /// below z ≈ −0.23), p(1.5) = 0.5 (a true match in a 15-exemplar
+    /// index: two dots), p(3) ≈ 0.82 (a standout even in an index of
+    /// hundreds: three dots).
+    static let uncalibrated = LogisticCalibrator(slope: 1.0, intercept: -1.5)
 
     func probability(of z: Double) -> Double {
         let x = slope * CalibrationFeature.clamp(z) + intercept

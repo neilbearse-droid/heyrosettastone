@@ -134,11 +134,13 @@ final class CalibrationTests: XCTestCase {
 
     func testDefaultCalibratorIsSane() {
         let d = LogisticCalibrator.uncalibrated
-        XCTAssertEqual(d.probability(of: 0), 0.27, accuracy: 0.02, "a match merely at the mean is probably wrong")
-        XCTAssertGreaterThan(d.probability(of: 2), 0.85)
-        XCTAssertLessThan(d.probability(of: -0.5), 0.16)
-        XCTAssertLessThan(d.probability(of: -1.3), 0.06, "well below the mean falls under the engine's floor")
-        XCTAssertGreaterThan(d.probability(of: 1.5), 0.75)
+        XCTAssertEqual(d.probability(of: 0), 0.18, accuracy: 0.02, "a match merely at the mean is probably wrong")
+        XCTAssertLessThan(d.probability(of: -0.5), 0.15, "below the mean falls under the engine's floor")
+        XCTAssertLessThan(d.probability(of: -1.3), 0.06)
+        XCTAssertEqual(d.probability(of: 1.5), 0.5, accuracy: 0.01,
+                       "a true match in a small index (z ≈ 1.5-1.8) earns two dots, not three")
+        XCTAssertLessThan(d.probability(of: 2), 0.75, "the leader of an index is at z ≈ 2 by construction; no third dot yet")
+        XCTAssertGreaterThan(d.probability(of: 3), 0.75, "a real standout gets three")
     }
 
     func testExtremeInputsStayFinite() {

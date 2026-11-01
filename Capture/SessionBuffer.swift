@@ -128,7 +128,15 @@ final class SessionBuffer {
     ///
     /// `receivedAt` is the wall-clock time the last sample of this chunk
     /// left the microphone. Optional: tests drive the sample clock alone.
-    func ingest(_ samples: [Float], receivedAt: Date? = nil) {
+    ///
+    /// `muted`: the microphone is hearing the phone itself (the board is
+    /// talking), so these samples must not become speech. They still
+    /// advance the clock — an open utterance ends through the normal
+    /// hangover and a session still closes on time — but the detector is
+    /// not consulted and not trained: feeding it digital silence would
+    /// collapse the learned noise floor in about a second and leave it
+    /// hair-trigger when real audio returns.
+    func ingest(_ samples: [Float], receivedAt: Date? = nil, muted: Bool = false) {
         pendingSamples.append(contentsOf: samples)
         if let receivedAt {
             anchorDate = receivedAt
@@ -137,7 +145,7 @@ final class SessionBuffer {
         while pendingSamples.count >= Self.frameLength {
             let frame = Array(pendingSamples.prefix(Self.frameLength))
             pendingSamples.removeFirst(Self.frameLength)
-            process(frame: frame)
+            process(frame: frame, muted: muted)
         }
     }
 
@@ -163,7 +171,7 @@ final class SessionBuffer {
 
     // MARK: - Internals
 
-    private func process(frame: [Float]) {
+    private func process(frame: [Float], muted: Bool = false) {
         streamPosition += frame.count
 
         // Maintain the rolling recent-audio buffer. It must hold enough to
@@ -175,7 +183,7 @@ final class SessionBuffer {
             preRollBuffer.removeFirst(preRollBuffer.count - ringCapacity)
         }
 
-        let speech = vad.isSpeech(frame[...])
+        let speech = muted ? false : vad.isSpeech(frame[...])
         if speech {
             speechRun += 1
             silenceRun = 0

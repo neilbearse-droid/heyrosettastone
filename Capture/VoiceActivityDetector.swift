@@ -59,11 +59,17 @@ struct EnergyVAD: VoiceActivityDetector {
         currentThreshold = threshold
 
         if speech {
-            // Slow upward tracking: a constant-level sound stops being
-            // "speech" once the floor has absorbed it (time constant
-            // ~6 s at 30 ms frames; a level 3x above the old floor
-            // un-latches in ~2.5 s).
-            noiseFloor = 0.995 * noiseFloor + 0.005 * rms
+            // Slow upward tracking so a sustained constant-level sound
+            // (TV, dishwasher) stops being "speech" once the floor has
+            // absorbed it, without cutting the child's own long
+            // vocalizations. With 0.9985 per 30 ms frame a constant signal
+            // at 2x the threshold un-latches after ~4.5 s, at 3.3x after
+            // ~6 s, and any level within ~8 s (= SessionBuffer
+            // maxUtterance, which bounds the damage anyway). 0.995 here
+            // cut a 4 s vocalization at 2x the threshold after 1.6 s and
+            // dropped the rest; a missed utterance costs training data, a
+            // false segment costs one swipe in Review.
+            noiseFloor = 0.9985 * noiseFloor + 0.0015 * rms
         } else {
             noiseFloor = 0.95 * noiseFloor + 0.05 * rms
         }

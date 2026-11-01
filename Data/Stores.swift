@@ -251,6 +251,16 @@ struct SegmentStore {
         try db.dbQueue.read { try SegmentRecord.fetchOne($0, key: id) }
     }
 
+    /// The current rows for these ids, in no particular order; ids with no
+    /// row are simply absent. CaptureController.refreshSegmentStates uses
+    /// it to drop chips Review has resolved.
+    func fetch(ids: [String]) throws -> [SegmentRecord] {
+        guard !ids.isEmpty else { return [] }
+        return try db.dbQueue.read { db in
+            try SegmentRecord.filter(ids.contains(Column("id"))).fetchAll(db)
+        }
+    }
+
     /// Review "Discard": noise, TV, etc. With `deleteClip` the file goes
     /// too and `clipRef` becomes `FileLocations.deletedClipRef`.
     func discard(id: String, deleteClip: Bool = false, at date: Date = Date()) throws {
@@ -451,13 +461,32 @@ struct EventLog {
             .sorted { $0.day < $1.day }
     }
 
+    /// True when the exchange reached understanding on a parent or child
+    /// surface: a confirm event (Confirm card, Ask flow) or a board tap by
+    /// him attached to this exchange id. Capture uses it to avoid logging
+    /// an abandon marker for an exchange that was in fact resolved.
+    func hasResolution(exchangeId: String) throws -> Bool {
+        try db.dbQueue.read { db in
+            try Bool.fetchOne(
+                db,
+                sql: "SELECT EXISTS (SELECT 1 FROM events WHERE exchangeId = ? AND type IN (?, ?))",
+                arguments: [exchangeId, EventType.confirm.rawValue, EventType.boardTap.rawValue]
+            ) ?? false
+        }
+    }
+
     /// §2.9 abandoned-exchange rate. Among sessions started since `since`
-    /// that captured at least one segment, the fraction that were never
-    /// resolved: no confirm event carries the session id as its exchangeId,
-    /// and none of its segments was labelled within 24 h of the session
-    /// opening (the Review expiry window). Sessions younger than 24 h that
-    /// are still unresolved are undecided and excluded from both sides.
-    /// Nil when there is nothing to measure.
+    /// that captured at least one segment of his, the fraction that never
+    /// reached understanding. Resolved: a confirm event or a board tap by
+    /// him carries the session id as its exchangeId (he got there through
+    /// his AAC, which is understanding), or one of its segments was
+    /// labelled within 24 h of the session opening (the Review expiry
+    /// window). Abandoned: none of that, and a segment is still pending
+    /// past the window, expired, or was labelled only after it. Sessions
+    /// younger than 24 h that are still unresolved are undecided, and
+    /// sessions whose every segment was discarded or marked "not him"
+    /// (TV, a sibling) were never an exchange with him; both are excluded
+    /// from both sides. Nil when there is nothing to measure.
     func abandonedRate(since: Date, now: Date = Date()) throws -> Double? {
         let outcomes = try exchangeOutcomes(since: since, now: now)
         let total = outcomes.resolved + outcomes.abandoned
@@ -475,7 +504,7 @@ struct EventLog {
                 SELECT s.id AS id, s.startedAt AS startedAt,
                     EXISTS (
                         SELECT 1 FROM events e
-                        WHERE e.exchangeId = s.id AND e.type = ?
+                        WHERE e.exchangeId = s.id AND e.type IN (?, ?)
                     ) AS confirmed,
                     (
                         SELECT MIN(g.labelledAt) FROM segments g
@@ -484,15 +513,21 @@ struct EventLog {
                     EXISTS (
                         SELECT 1 FROM segments g
                         WHERE g.sessionId = s.id AND g.state = ?
-                    ) AS hasPending
+                    ) AS hasPending,
+                    EXISTS (
+                        SELECT 1 FROM segments g
+                        WHERE g.sessionId = s.id AND g.state = ?
+                    ) AS hasExpired
                 FROM sessions s
                 WHERE s.startedAt >= ?
                   AND EXISTS (SELECT 1 FROM segments g WHERE g.sessionId = s.id)
                 """,
                 arguments: [
                     EventType.confirm.rawValue,
+                    EventType.boardTap.rawValue,
                     SegmentState.labelled.rawValue,
                     SegmentState.pending.rawValue,
+                    SegmentState.expired.rawValue,
                     since,
                 ]
             )
@@ -503,6 +538,7 @@ struct EventLog {
                 let confirmed: Bool = row["confirmed"] ?? false
                 let firstLabelledAt: Date? = row["firstLabelledAt"]
                 let hasPending: Bool = row["hasPending"] ?? false
+                let hasExpired: Bool = row["hasExpired"] ?? false
                 let window = startedAt.addingTimeInterval(ReviewQueue.expiryInterval)
 
                 let labelledInTime: Bool
@@ -516,9 +552,11 @@ struct EventLog {
                     resolved += 1
                 } else if hasPending && now < window {
                     continue // still in the Review window: undecided
-                } else {
+                } else if hasPending || hasExpired || firstLabelledAt != nil {
                     abandoned += 1
                 }
+                // Otherwise every segment was discarded or "not him": not
+                // an exchange with him, so neither side counts it.
             }
             return (resolved: resolved, abandoned: abandoned)
         }

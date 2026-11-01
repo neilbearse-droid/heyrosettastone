@@ -77,10 +77,14 @@ struct EmbeddingBackfill {
     /// Exemplar and negative rows share a clip with the segment they came
     /// from; whatever embedding the segment already carries is copied over
     /// in one statement each. Rows with no matching embedded segment stay
-    /// NULL (the subquery yields NULL) and are encoded below.
+    /// NULL (the subquery yields NULL) and are encoded below. The deletion
+    /// tombstone (`FileLocations.deletedClipRef`) is shared by every row
+    /// whose audio is gone, so it is excluded from the join: it must never
+    /// copy some unrelated deleted clip's vector onto a row.
     func copyEmbeddingsFromSegments() async {
         // In async contexts Swift resolves GRDB's read/write to the async
         // overloads, hence the awaits throughout this file.
+        let tombstone = FileLocations.deletedClipRef
         try? await db.dbQueue.write { db in
             try db.execute(sql: """
                 UPDATE exemplars SET embedding = (
@@ -88,16 +92,16 @@ struct EmbeddingBackfill {
                     WHERE s.clipRef = exemplars.clipRef AND s.embedding IS NOT NULL
                     LIMIT 1
                 )
-                WHERE embedding IS NULL
-                """)
+                WHERE embedding IS NULL AND clipRef != ?
+                """, arguments: [tombstone])
             try db.execute(sql: """
                 UPDATE negatives SET embedding = (
                     SELECT s.embedding FROM segments s
                     WHERE s.clipRef = negatives.clipRef AND s.embedding IS NOT NULL
                     LIMIT 1
                 )
-                WHERE embedding IS NULL AND clipRef IS NOT NULL
-                """)
+                WHERE embedding IS NULL AND clipRef IS NOT NULL AND clipRef != ?
+                """, arguments: [tombstone])
         }
     }
 
