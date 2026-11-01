@@ -696,3 +696,72 @@ Consider a 250 ms same-intent debounce.
    engine-level test harness first; most of these are invisible without it.
 4. **Then:** B2 (import), D3, D4, D5, A5, A6, A7, B5, C10, C11, C13, Silero
    VAD, and the remaining low items.
+
+---
+
+## Implementation status (2026-11-01)
+
+Everything in sections A through E has been implemented on branch
+`claude/rosetta-communication-app-mx93m1`, in these commits:
+
+| Commit | Scope |
+|--------|-------|
+| 1184fd1 | Data layer: A1 (protection classes), B1-B6, D3 data, migration v3, DataLayerTests |
+| bacdcbd | Capture layer: A1-A8, D1, D7, SessionBuffer and BoardLayout tests |
+| c6e64bc | Model layer: C1-C14, C3 engine exclusion, MeanPoolTests, SuggestionEngineTests |
+| dbc8d15 | App layer: C3 UI, C9, D2, D4-D9, B2/B4/B5 UI, A8 first run, ConfirmFlowTests |
+| cf66331, 54e1adf | Compile-hardening after two independent read-through reviews |
+
+Deliberately not done: the lock-screen Live Activity for Confirm
+(section 7 of the spec; a tab badge is the interim), and Silero VAD
+(the energy VAD was fixed instead; Silero remains the real fix for TV
+and sibling voices and `docs/silero-vad-conversion.md` is the plan).
+
+### Nothing here has been compiled
+
+No Xcode was available where this work was done. Every file was read
+end to end by two reviewers acting as the compiler, and three genuine
+compile errors were caught and fixed that way, but the first real build
+will find more. Open the project, build, and start with this list:
+
+1. `Model/SuggestionEngine.swift` around line 81: `nonisolated init` on a
+   `@MainActor @Observable` class. If the Observation macro rejects it,
+   drop `nonisolated` and make `AppEnvironment.init` and the engine tests
+   main-actor.
+2. `@ObservationIgnored` on `let` properties in `Model/SuggestionEngine.swift`
+   (lines ~61, 66) and `Capture/CaptureController.swift` (lines ~62-66).
+   If rejected, delete the attribute on those lets.
+3. `Board/SpeechOutput.swift`: `@Observable` on an `NSObject` subclass with
+   an `override init()` and an `OSAllocatedUnfairLock` stored property.
+   `SpeechOutput` must stay non-main-actor because the capture queue reads
+   `selfSpeakingUntil`.
+4. `App/ListenView.swift` around line 344: `.sheet(item: Bindable(export).result)`.
+   Fallback is `@Bindable var export = export` then `$export.result`.
+5. `App/ProgressTabView.swift` around line 181: `Chart(latencyTrend, id: \.day)`
+   over a labelled tuple. If Charts' inference balks, map to a small
+   Identifiable struct.
+6. `App/ConfirmCardView.swift` around line 232: trailing closure on the
+   `.ask` enum case (pre-existing pattern).
+7. `Model/MaturityGate.swift` around line 317: `cblas_sgemm` is deprecated
+   in the iOS 17 SDK (warning only unless warnings are errors).
+8. Non-Sendable captures in `Task.detached` closures (RosettaApp, RootView,
+   ConfirmCardView, DataTransfer, ListenView): warnings under Swift 5.10,
+   errors only under strict concurrency, which `project.yml` does not enable.
+
+### Verify on device, in this order
+
+1. Lock the phone while listening, say something, unlock: a new segment
+   row must exist (A1). On an upgraded install, check `clips/` reports
+   `NSFileProtectionCompleteUnlessOpen`.
+2. Take a phone call while listening: indicator goes amber with a reason,
+   then returns to green and a new session opens (A2). Repeat with
+   headphones plug/unplug.
+3. Tap a Board word while listening: no new chip appears on Confirm (A3).
+   If `setVoiceProcessingEnabled(true)` breaks capture on the device, delete
+   that one line; the zero-feed gate still works.
+4. Leave a TV on near the station for five minutes: Review must not fill
+   with 90 s segments (A4). Check the Listen level meter shows the child
+   crossing the threshold at 2-3 m; if not, lower `EnergyVAD.minimumRMS`.
+5. Log the real z distribution from a handful of clips before tuning
+   `probabilityFloor` or the uncalibrated default (C1).
+6. Export, wipe, restore from the Files app, confirm clip count matches (B2).
