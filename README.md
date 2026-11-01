@@ -64,9 +64,10 @@ principles that are hard constraints, not suggestions.
 - No accounts, no analytics, no third-party SDKs beyond GRDB and WhisperKit.
 - No gradient training on device: learning is append-only exemplar
   accumulation plus threshold calibration (§5.1).
-- The Silero VAD runtime is still pending; Phase 1's energy VAD serves
-  behind the same protocol, and the conversion step is documented in
-  [`docs/silero-vad-conversion.md`](docs/silero-vad-conversion.md).
+- Silero VAD runs when a converted Core ML model is bundled (optional,
+  never downloaded; see
+  [`docs/silero-vad-conversion.md`](docs/silero-vad-conversion.md));
+  without it the energy VAD serves behind the same protocol.
 - Phase 3: guest mode, speaker filtering, multi-station sync, SLP PDF
   export, board layout editing.
 

@@ -34,10 +34,18 @@ final class CaptureController: SessionBufferDelegate {
     private(set) var lastError: String?
     /// Wall-clock open time of the active session, for confirm latency.
     private(set) var activeSessionOpenedAt: Date?
-    /// Microphone level readout for the Listen tab: the last frame's RMS
-    /// and the VAD threshold it was judged against. Updated at most ~10 Hz
-    /// while listening; (0, 0) otherwise.
-    private(set) var liveLevel: (rms: Float, threshold: Float) = (0, 0)
+    /// Microphone level readout for the Listen tab: the last frame's RMS,
+    /// the energy threshold it was judged against, and — when the Silero
+    /// detector is active — its last speech probability in 0...1 (nil for
+    /// the energy detector). `rms` and `threshold` keep their energy meaning
+    /// under both detectors: `SileroVAD` runs an `EnergyVAD` alongside for
+    /// the readout. Updated at most ~10 Hz while listening; (0, 0, nil)
+    /// otherwise.
+    private(set) var liveLevel: (rms: Float, threshold: Float, confidence: Float?) = (0, 0, nil)
+    /// Which detector is listening: Silero when its model is bundled
+    /// (docs/silero-vad-conversion.md), else the energy gate. Set at the
+    /// first start; the detector is carried across later starts.
+    private(set) var vadKind: VoiceActivityDetectorFactory.Kind = .energy
 
     /// Station identity for context priors, e.g. "Kitchen" (§5.3). Stored so
     /// @Observable notifies; didSet persists and refreshes the capture-side
@@ -142,13 +150,18 @@ final class CaptureController: SessionBufferDelegate {
         let now = Date()
         // Capture-queue state is only touched on the queue, even when the
         // engine is idle: a stalled engine may be resuming concurrently.
+        var kind = VoiceActivityDetectorFactory.Kind.energy
         engine.performSync {
             let detector: VoiceActivityDetector
             if self.hasStartedOnce {
                 detector = self.buffer.detector
             } else {
-                detector = EnergyVAD()
+                // Silero if its model is bundled, else the energy gate.
+                // Loading blocks this (main-thread) call briefly on the
+                // first start only.
+                detector = VoiceActivityDetectorFactory.makeDefault()
             }
+            kind = VoiceActivityDetectorFactory.kind(of: detector)
             self.hasStartedOnce = true
             let fresh = SessionBuffer(vad: detector)
             fresh.delegate = self
@@ -158,6 +171,7 @@ final class CaptureController: SessionBufferDelegate {
             self.lastLevelPublish = .distantPast
             self.lastDiskCheck = now
         }
+        vadKind = kind
 
         let speech = SpeechOutput.shared
         do {
@@ -182,7 +196,7 @@ final class CaptureController: SessionBufferDelegate {
             self.buffer.interrupt()
         }
         isListening = false
-        liveLevel = (0, 0)
+        liveLevel = (0, 0, nil)
         setIdleTimerDisabled(false)
     }
 
@@ -233,7 +247,10 @@ final class CaptureController: SessionBufferDelegate {
     private func publishLevelIfDue(now: Date) {
         guard now.timeIntervalSince(lastLevelPublish) >= Self.levelPublishInterval else { return }
         lastLevelPublish = now
-        let level = buffer.liveLevel
+        let detector = buffer.detector
+        let level = (rms: detector.currentRMS,
+                     threshold: detector.currentThreshold,
+                     confidence: detector.currentConfidence)
         Task { @MainActor in
             self.liveLevel = level
         }
@@ -262,7 +279,7 @@ final class CaptureController: SessionBufferDelegate {
             // notice must not turn a running station amber.
             guard !self.engine.isRunning else { return }
             self.isListening = false
-            self.liveLevel = (0, 0)
+            self.liveLevel = (0, 0, nil)
             self.lastError = message
             self.setIdleTimerDisabled(false)
         }

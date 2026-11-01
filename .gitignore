@@ -23,3 +23,6 @@ Tests/Fixtures/generated/
 # Bundled ML checkpoints — each developer fetches once, never in git
 # (docs/whisperkit-model-bundling.md)
 WhisperKitModels/
+
+# Optional Silero VAD Core ML model (docs/silero-vad-conversion.md)
+CoreMLModels/

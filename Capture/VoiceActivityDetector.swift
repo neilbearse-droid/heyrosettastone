@@ -18,6 +18,15 @@ protocol VoiceActivityDetector {
     /// decision threshold here instead.
     var currentRMS: Float { get }
     var currentThreshold: Float { get }
+
+    /// Speech probability (0...1) of the most recent decision for a
+    /// probability-based detector (Silero); nil for a detector that has no
+    /// such number (the energy gate). Defaults to nil below.
+    var currentConfidence: Float? { get }
+}
+
+extension VoiceActivityDetector {
+    var currentConfidence: Float? { nil }
 }
 
 /// Adaptive-threshold RMS energy gate. Deliberately biased toward

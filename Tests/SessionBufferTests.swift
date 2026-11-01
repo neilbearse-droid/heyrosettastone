@@ -233,6 +233,49 @@ final class SessionBufferTests: XCTestCase {
         XCTAssertLessThan(control.liveLevel.threshold, thresholdAfterSpeech)
     }
 
+    func testSileroDetectorDrivesTheSameExchangeSemantics() {
+        // Same exchange as testSingleUtteranceOpensSessionAndClosesOnSilence,
+        // detected by SileroVAD over a fake runner that calls a window
+        // "speech" (0.9) while the tone is in it and silent (0.05) after:
+        // the buffer's debounce, hangover, pre/post-roll and the 10 s close
+        // must come out identical, because the detector only changes
+        // detection quality, never exchange semantics.
+        let runner = FakeSileroRunner(decide: { window in
+            AudioFixtures.rms(window) > 0.1 ? 0.9 : 0.05
+        })
+        let recorder = BufferRecorder()
+        let buffer = SessionBuffer(vad: SileroVAD(runner: runner))
+        buffer.delegate = recorder
+
+        buffer.ingest(AudioFixtures.silence(seconds: 0.5))
+        buffer.ingest(AudioFixtures.tone(seconds: 1.0))
+        buffer.ingest(AudioFixtures.silence(seconds: 11))
+
+        XCTAssertEqual(recorder.opens.count, 1)
+        XCTAssertEqual(recorder.segments.count, 1)
+        XCTAssertEqual(recorder.closes.count, 1)
+        XCTAssertEqual(recorder.closes[0].reason, .silence)
+
+        let segment = recorder.segments[0]
+        XCTAssertEqual(segment.startTime, 0.5, accuracy: 0.2)
+        // The 1 s tone plus pre-roll and post-roll; the Silero window lag
+        // (≤ 32 ms) is inside the tolerance.
+        XCTAssertEqual(segment.duration, 1.3, accuracy: 0.3)
+        XCTAssertEqual(recorder.closes[0].time, 11.5, accuracy: 0.6)
+
+        // The model ran once per 512 samples over every whole 480-sample
+        // frame of the 12.5 s: 416 frames = 199 680 samples = 390 windows.
+        let wholeFrames = AudioFixtures.samples(seconds: 12.5) / SessionBuffer.frameLength
+        XCTAssertEqual(runner.calls, wholeFrames * SessionBuffer.frameLength / SileroVAD.windowSamples)
+
+        // The detector reports the model's probability and the energy
+        // readout: silence at the end, so low confidence and low RMS.
+        let detector = buffer.detector
+        XCTAssertEqual(detector.currentConfidence ?? -1, 0.05, accuracy: 0.0001)
+        XCTAssertEqual(detector.currentRMS, 0, accuracy: 0.0001)
+        XCTAssertGreaterThan(detector.currentThreshold, 0)
+    }
+
     func testLabelAttachesToCorrectSegments() throws {
         // End-to-end stamping: buffer output → database rows → confirm →
         // exemplars carry exactly the selected segments' clips.

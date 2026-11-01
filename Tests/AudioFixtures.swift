@@ -11,6 +11,23 @@ enum AudioFixtures {
         Int(seconds * Double(sampleRate))
     }
 
+    /// Splits samples into whole `SessionBuffer.frameLength` frames, as the
+    /// buffer feeds a detector; a trailing partial frame is dropped.
+    static func frames(_ samples: [Float]) -> [[Float]] {
+        let length = SessionBuffer.frameLength
+        return stride(from: 0, to: samples.count - length + 1, by: length).map { start in
+            Array(samples[start..<start + length])
+        }
+    }
+
+    /// Root-mean-square level of a window, as a fake detector would judge it.
+    static func rms(_ samples: [Float]) -> Float {
+        guard !samples.isEmpty else { return 0 }
+        var sum: Float = 0
+        for sample in samples { sum += sample * sample }
+        return (sum / Float(samples.count)).squareRoot()
+    }
+
     static func tone(seconds: TimeInterval, amplitude: Float = 0.5, frequency: Double = 330) -> [Float] {
         let count = samples(seconds: seconds)
         return (0..<count).map { i in

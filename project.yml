@@ -37,6 +37,16 @@ targets:
       - path: WhisperKitModels/openai_whisper-tiny
         type: folder
         optional: true
+      # Optional Silero VAD model (docs/silero-vad-conversion.md). A
+      # .mlpackage in the sources phase is compiled by Xcode into
+      # SileroVAD.mlmodelc at the bundle root, which is where
+      # CoreMLSileroRunner looks. Gitignored like the WhisperKit folder;
+      # `optional: true` keeps `xcodegen generate` working without it (the
+      # energy VAD then serves, see VoiceActivityDetectorFactory).
+      - path: CoreMLModels/SileroVAD.mlpackage
+        type: file
+        buildPhase: sources
+        optional: true
     dependencies:
       - package: GRDB
         product: GRDB
@@ -80,6 +90,11 @@ targets:
         # App icon lives in App/Assets.xcassets/AppIcon.appiconset. XcodeGen
         # auto-includes the .xcassets as a resource; this names the icon set.
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # No generated Swift class for bundled Core ML models: Xcode would
+        # name it after the file (`SileroVAD`), colliding with the
+        # `SileroVAD` detector struct. The runner loads models through the
+        # generic MLModel API anyway.
+        COREML_CODEGEN_LANGUAGE: None
         # Principle 7: no network entitlement. Nothing here requests one, and
         # no networking framework is linked. Keep it that way.
         CODE_SIGN_ENTITLEMENTS: ""
