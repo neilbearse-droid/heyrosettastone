@@ -14,6 +14,35 @@ final class LabelSimilarityTests: XCTestCase {
         XCTAssertTrue(LabelSimilarity.areNearDuplicates("bathrom", "bathroom"))
     }
 
+    func testShortWordsOneEditApartAreDifferentWords() {
+        // One edit on a three-letter word is a different word, not a typo.
+        XCTAssertFalse(LabelSimilarity.areNearDuplicates("dad", "mad"))
+        XCTAssertFalse(LabelSimilarity.areNearDuplicates("cat", "hat"))
+        XCTAssertFalse(LabelSimilarity.areNearDuplicates("bed", "bad"))
+    }
+
+    func testInflectedFormsAreFlagged() {
+        XCTAssertTrue(LabelSimilarity.areNearDuplicates("snacks", "snack"))
+        XCTAssertTrue(LabelSimilarity.areNearDuplicates("Snacks", "snack"))
+        XCTAssertTrue(LabelSimilarity.areNearDuplicates("cookies", "cookie"))
+    }
+
+    func testMultiWordFormsReachTheConceptClusters() {
+        XCTAssertTrue(LabelSimilarity.areNearDuplicates("want food", "hungry"))
+        XCTAssertTrue(LabelSimilarity.areNearDuplicates("go potty", "bathroom"))
+        XCTAssertTrue(LabelSimilarity.areNearDuplicates("my cup", "thirsty"))
+        XCTAssertTrue(LabelSimilarity.areNearDuplicates("snack please", "food"))
+        XCTAssertTrue(LabelSimilarity.areNearDuplicates("more", "again"),
+                      "a label that is only a stopword keeps its raw token")
+    }
+
+    func testTokenizerStripsStopwordsAndPlurals() {
+        XCTAssertEqual(LabelSimilarity.tokens("Want my snacks, please!"), ["snack"])
+        XCTAssertEqual(LabelSimilarity.tokens("all done"), ["all", "done"])
+        XCTAssertEqual(LabelSimilarity.tokens("glass"), ["glass"], "a trailing double-s is not a plural")
+        XCTAssertEqual(LabelSimilarity.tokens("bus"), ["bus"], "short words are not stemmed")
+    }
+
     func testConceptClustersCatchSynonyms() {
         // The spec's own example: snack vs hungry.
         XCTAssertTrue(LabelSimilarity.areNearDuplicates("snack", "hungry"))
@@ -32,5 +61,15 @@ final class LabelSimilarityTests: XCTestCase {
         let conflicts = LabelSimilarity.conflicts(for: "snack", in: existing)
         XCTAssertEqual(conflicts, ["hungry"])
         XCTAssertTrue(LabelSimilarity.conflicts(for: "trampoline", in: existing).isEmpty)
+    }
+
+    func testSemanticFallbackIsGuardedAndSymmetric() {
+        // Whether or not the on-device word embedding is present, the
+        // fallback must never crash and must give the same answer both ways.
+        let a = LabelSimilarity.semanticallyClose(["cookie"], ["biscuit"])
+        let b = LabelSimilarity.semanticallyClose(["biscuit"], ["cookie"])
+        XCTAssertEqual(a, b)
+        XCTAssertFalse(LabelSimilarity.semanticallyClose(["dad"], ["mad"]), "short tokens never use the embedding")
+        XCTAssertFalse(LabelSimilarity.semanticallyClose([], ["banana"]))
     }
 }

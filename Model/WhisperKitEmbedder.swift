@@ -7,6 +7,10 @@ import WhisperKit
 /// Transcription is never invoked — only the encoder runs (§1: the app
 /// never attempts transcription).
 ///
+/// An actor: the underlying `WhisperKit` instance is not thread-safe and
+/// the Core ML encoder is a serial resource anyway, so concurrent callers
+/// (capture, the Confirm card, backfill) queue here instead of racing.
+///
 /// The model MUST be bundled with the app (docs/whisperkit-model-bundling.md).
 /// `download: false` is hard-coded: Rosetta makes no network calls, so a
 /// missing bundle means no suggestions — the app stays fully functional as
@@ -16,7 +20,7 @@ import WhisperKit
 /// featureExtractor/audioEncoder surface occasionally shifts between
 /// releases; if a WhisperKit upgrade breaks this file, this is the only
 /// file to touch — everything else sees `EmbeddingProvider`.
-final class WhisperKitEmbedder: EmbeddingProvider {
+actor WhisperKitEmbedder: EmbeddingProvider {
     enum EmbedError: Error {
         case modelUnavailable
         case unexpectedEncoderOutput
@@ -28,9 +32,20 @@ final class WhisperKitEmbedder: EmbeddingProvider {
     private static let framesPerSecond = 50.0
 
     private let whisperKit: WhisperKit
-    private(set) var dimension: Int
+    /// Encoder width for the bundled checkpoint.
+    nonisolated let dimension: Int
 
     static let modelName = "openai_whisper-tiny"
+
+    /// Encoder width per Whisper checkpoint family.
+    static func encoderWidth(forModelNamed name: String) -> Int {
+        let lower = name.lowercased()
+        if lower.contains("large") { return 1280 }
+        if lower.contains("medium") { return 1024 }
+        if lower.contains("small") { return 768 }
+        if lower.contains("base") { return 512 }
+        return 384
+    }
 
     /// The bundled Core ML model folder, or nil if the app was built
     /// without one.
@@ -59,7 +74,7 @@ final class WhisperKitEmbedder: EmbeddingProvider {
 
     private init(whisperKit: WhisperKit) {
         self.whisperKit = whisperKit
-        self.dimension = 384 // whisper-tiny encoder width; corrected on first embed
+        self.dimension = Self.encoderWidth(forModelNamed: Self.modelName)
     }
 
     func embed(samples: [Float]) async throws -> [Float] {
@@ -73,9 +88,10 @@ final class WhisperKitEmbedder: EmbeddingProvider {
 
         let audioArray = try MLMultiArray(shape: [NSNumber(value: Self.windowSamples)], dataType: .float32)
         window.withUnsafeBufferPointer { source in
+            guard let base = source.baseAddress else { return }
             audioArray.dataPointer
                 .assumingMemoryBound(to: Float.self)
-                .update(from: source.baseAddress!, count: Self.windowSamples)
+                .update(from: base, count: Self.windowSamples)
         }
 
         // WhisperKit's protocols return `any FeatureExtractorOutputType` /
@@ -91,19 +107,21 @@ final class WhisperKitEmbedder: EmbeddingProvider {
         let utteranceSeconds = Double(min(samples.count, Self.windowSamples)) / 16_000.0
         let usefulFrames = max(1, Int((utteranceSeconds * Self.framesPerSecond).rounded(.up)))
         let vector = try Self.meanPool(encoderOutput: encoded, maxFrames: usefulFrames)
-        dimension = vector.count
         return VectorMath.l2Normalized(vector)
     }
 
     /// Encoder output is (1, dim, 1, frames). Mean over the frame axis,
-    /// limited to `maxFrames`.
+    /// limited to `maxFrames`. Reads through the array's strides so any
+    /// layout Core ML hands back (including padded/pitched buffers) is
+    /// read correctly; handles float32 and float16 storage.
     static func meanPool(encoderOutput: MLMultiArray, maxFrames: Int) throws -> [Float] {
         let shape = encoderOutput.shape.map(\.intValue)
         guard shape.count == 4, shape[0] == 1, shape[2] == 1 else {
             throw EmbedError.unexpectedEncoderOutput
         }
         let dim = shape[1]
-        let frames = min(shape[3], maxFrames)
+        let frames = min(shape[3], max(1, maxFrames))
+        guard dim > 0, frames > 0 else { throw EmbedError.unexpectedEncoderOutput }
         let dimStride = encoderOutput.strides[1].intValue
         let frameStride = encoderOutput.strides[3].intValue
 

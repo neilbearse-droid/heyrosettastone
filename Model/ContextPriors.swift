@@ -1,9 +1,16 @@
 import Foundation
 
-/// Cheap accuracy (§5.3): multiply kNN scores by a smoothed prior built
-/// from hour-of-day bucket, capture-station identity, and short-horizon
-/// recency of the same intent. Routines make these strong — banana at 7am
-/// on the kitchen device should outrank banana at 9pm in the bath.
+/// Cheap accuracy (§5.3): multiply the calibrated probability by a smoothed
+/// prior built from hour-of-day bucket, capture-station identity, and
+/// short-horizon recency of the same intent. Routines make these strong —
+/// banana at 7am on the kitchen device should outrank banana at 9pm in the
+/// bath — but the prior is a tie-breaker, not the decider: each
+/// conditional lift is clamped to [liftFloor, liftCeiling] so routine
+/// context can never outvote the acoustics by orders of magnitude.
+///
+/// The prior is applied to the probability for RANKING only; the
+/// calibrator's input stays the acoustic feature so stored observations
+/// remain comparable as counts grow.
 struct ContextPriors {
     struct Snapshot {
         let hourOfDay: Int
@@ -17,13 +24,26 @@ struct ContextPriors {
         /// Laplace smoothing so sparse history stays gentle.
         var smoothing: Double = 2
         /// Exponent tempering the conditional priors (1 = full strength).
-        var temper: Double = 0.5
+        var temper: Double = 0.25
+        /// Per-condition lift clamp. Two conditions (hour, station) plus
+        /// the recency boost bound the combined multiplier to
+        /// [liftFloor², liftCeiling² · (1 + recencyBoost)].
+        var liftFloor: Double = 0.5
+        var liftCeiling: Double = 2.0
         /// Short-horizon recency boost: size and time constant.
         var recencyBoost: Double = 0.5
         var recencyTau: TimeInterval = 30 * 60
+
+        /// Smallest multiplier `prior(for:context:)` can return.
+        var minimumMultiplier: Double { liftFloor * liftFloor }
+        /// Largest multiplier `prior(for:context:)` can return.
+        var maximumMultiplier: Double { liftCeiling * liftCeiling * (1 + recencyBoost) }
     }
 
-    /// (intentId, hourOfDay, station, timestamp) per historical confirmation.
+    /// (intentId, hourOfDay, station, timestamp) per historical
+    /// confirmation. `hourOfDay` and `timestamp` must describe when the
+    /// utterance was CAPTURED, not when it was labelled — evening Review
+    /// labelling must not make every word an 8 pm word.
     struct Observation {
         let intentId: String
         let hourOfDay: Int
@@ -31,7 +51,7 @@ struct ContextPriors {
         let timestamp: Date
     }
 
-    private let config: Config
+    let config: Config
     private let intentIds: [String]
     private var byBucket: [Int: [String: Int]] = [:]
     private var bucketTotals: [Int: Int] = [:]
@@ -43,7 +63,7 @@ struct ContextPriors {
         self.config = config
         self.intentIds = intentIds
         for obs in observations {
-            let bucket = obs.hourOfDay / config.bucketHours
+            let bucket = obs.hourOfDay / max(1, config.bucketHours)
             byBucket[bucket, default: [:]][obs.intentId, default: 0] += 1
             bucketTotals[bucket, default: 0] += 1
             byStation[obs.station, default: [:]][obs.intentId, default: 0] += 1
@@ -57,7 +77,8 @@ struct ContextPriors {
     /// Multiplier around 1: >1 when context says "likely now", <1 when the
     /// history says this intent rarely happens here/at this hour. With no
     /// history at all the prior is exactly 1 and ranking is untouched —
-    /// the model earns its way in (§2.1).
+    /// the model earns its way in (§2.1). Always within
+    /// [config.minimumMultiplier, config.maximumMultiplier].
     func prior(for intentId: String, context: Snapshot) -> Double {
         let n = max(1, intentIds.count)
         let uniform = 1.0 / Double(n)
@@ -70,13 +91,19 @@ struct ContextPriors {
             return (count + config.smoothing * uniform) / (Double(total) + config.smoothing)
         }
 
+        func clampedLift(_ p: Double) -> Double {
+            let lift = pow(p / uniform, config.temper)
+            guard lift.isFinite else { return 1 }
+            return min(max(lift, config.liftFloor), config.liftCeiling)
+        }
+
         var multiplier = 1.0
-        let bucket = context.hourOfDay / config.bucketHours
+        let bucket = context.hourOfDay / max(1, config.bucketHours)
         if let p = smoothedConditional(counts: byBucket[bucket], total: bucketTotals[bucket]) {
-            multiplier *= pow(p / uniform, config.temper)
+            multiplier *= clampedLift(p)
         }
         if let p = smoothedConditional(counts: byStation[context.station], total: stationTotals[context.station]) {
-            multiplier *= pow(p / uniform, config.temper)
+            multiplier *= clampedLift(p)
         }
 
         // Short-horizon recency: just-confirmed intents often repeat.
@@ -86,6 +113,6 @@ struct ContextPriors {
                 multiplier *= 1 + config.recencyBoost * exp(-delta / config.recencyTau)
             }
         }
-        return multiplier
+        return min(max(multiplier, config.minimumMultiplier), config.maximumMultiplier)
     }
 }

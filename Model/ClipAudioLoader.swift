@@ -2,14 +2,24 @@ import AVFoundation
 import Foundation
 
 /// Reads a stored m4a clip back into the pipeline's canonical 16 kHz mono
-/// Float32 samples, for embedding backfill and re-encoding.
+/// Float32 samples, for embedding backfill and re-encoding. Synchronous
+/// file I/O plus a format conversion: callers must run it off the main
+/// actor (the engine wraps it in `Task.detached`).
 enum ClipAudioLoader {
     enum LoadError: Error {
         case unreadable
         case conversionFailed
+        case missing
+    }
+
+    /// False for the deletion tombstone and for clips whose file is gone.
+    static func clipExists(clipRef: String) -> Bool {
+        guard !FileLocations.isDeleted(clipRef: clipRef) else { return false }
+        return FileManager.default.fileExists(atPath: FileLocations.clipURL(id: clipRef).path)
     }
 
     static func loadSamples(clipRef: String) throws -> [Float] {
+        guard clipExists(clipRef: clipRef) else { throw LoadError.missing }
         let url = FileLocations.clipURL(id: clipRef)
         let file = try AVAudioFile(forReading: url)
         let format = file.processingFormat

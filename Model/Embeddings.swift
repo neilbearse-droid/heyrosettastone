@@ -2,9 +2,11 @@ import Accelerate
 import Foundation
 
 /// Fixed-vector audio embedding (§5.1). Phase 2's live implementation is
-/// the WhisperKit encoder (WhisperKitEmbedder); tests use fixture vectors
-/// directly against the ranker and never touch this protocol.
-protocol EmbeddingProvider {
+/// the WhisperKit encoder (WhisperKitEmbedder, an actor so encoder calls
+/// serialize); engine tests inject a fake returning fixture vectors.
+/// Sendable because the engine hands the provider to detached tasks that
+/// load clip audio off the main actor.
+protocol EmbeddingProvider: Sendable {
     /// Embedding dimension this provider produces.
     var dimension: Int { get }
     /// 16 kHz mono samples → L2-normalized fixed vector.
