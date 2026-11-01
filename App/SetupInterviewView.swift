@@ -46,9 +46,12 @@ struct SetupInterviewView: View {
             }
             .navigationTitle("Setup")
             .navigationBarTitleDisplayMode(.inline)
+            // Folder only: a security-scoped URL to rosetta.json alone does
+            // not grant access to the clips/ and photos/ beside it, so a
+            // JSON pick would restore rows and silently copy no audio.
             .fileImporter(
                 isPresented: $showingRestore,
-                allowedContentTypes: [.folder, .json]
+                allowedContentTypes: [.folder]
             ) { result in
                 switch result {
                 case .success(let url):

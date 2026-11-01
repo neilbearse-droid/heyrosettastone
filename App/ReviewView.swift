@@ -37,7 +37,10 @@ struct ReviewView: View {
             .navigationTitle("Review")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    RecordingIndicator(isListening: env.capture.isListening)
+                    RecordingIndicator(
+                        isListening: env.capture.isListening,
+                        isStopped: env.capture.lastError != nil
+                    )
                 }
             }
             .sheet(item: $labelling) { segment in

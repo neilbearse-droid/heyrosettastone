@@ -20,16 +20,18 @@ struct ListenView: View {
             VStack(spacing: 28) {
                 Spacer()
 
-                RecordingIndicator(isListening: env.capture.isListening)
-                    .scaleEffect(1.3)
+                RecordingIndicator(
+                    isListening: env.capture.isListening,
+                    isStopped: env.capture.lastError != nil
+                )
+                .scaleEffect(1.3)
 
                 if env.capture.isListening {
                     statusText
-                    LevelMeter(
-                        rms: env.capture.liveLevel.rms,
-                        threshold: env.capture.liveLevel.threshold
-                    )
-                    .padding(.horizontal, 48)
+                    // Its own view so the 10 Hz level updates re-render the
+                    // meter alone, not this whole tab.
+                    LiveLevelMeter()
+                        .padding(.horizontal, 48)
                     if !liveGuesses.isEmpty {
                         liveGuessStrip
                     }
@@ -93,6 +95,9 @@ struct ListenView: View {
                 }
             }
             .sheet(isPresented: $showingSettings) { SettingsView() }
+            // onAppear too: the tab is rebuilt on leaving his board, which
+            // may be mid-exchange with chips already waiting.
+            .onAppear { refreshLiveGuesses() }
             .onChange(of: env.capture.recentSegments) { refreshLiveGuesses() }
         }
     }
@@ -158,6 +163,19 @@ struct ListenView: View {
         }
         .multilineTextAlignment(.center)
         .padding(.horizontal, 32)
+    }
+}
+
+/// Reads the capture controller's level itself, so only this view
+/// re-renders at the ~10 Hz publish rate.
+private struct LiveLevelMeter: View {
+    @Environment(AppEnvironment.self) private var env
+
+    var body: some View {
+        LevelMeter(
+            rms: env.capture.liveLevel.rms,
+            threshold: env.capture.liveLevel.threshold
+        )
     }
 }
 
@@ -344,9 +362,12 @@ struct SettingsView: View {
             .sheet(item: Bindable(export).result) { item in
                 ActivityShareSheet(item: item)
             }
+            // Folder only: a security-scoped URL to rosetta.json alone does
+            // not grant access to the clips/ and photos/ beside it, so a
+            // JSON pick would restore rows and silently copy no audio.
             .fileImporter(
                 isPresented: $showingImporter,
-                allowedContentTypes: [.folder, .json]
+                allowedContentTypes: [.folder]
             ) { result in
                 switch result {
                 case .success(let url):
@@ -401,6 +422,10 @@ struct SettingsView: View {
                     return error.localizedDescription
                 }
             }.value
+            // Again after the delete: pausing cuts any utterance in
+            // progress, and its chip is appended to recentSegments on the
+            // main actor after the clear above ran.
+            env.capture.clearRecentSegments()
             MissingClipRegistry.shared.removeAll()
             PhotoCache.shared.removeAll()
             await env.suggestions.reload()

@@ -56,6 +56,17 @@ struct ChildBoardScreen: View {
                 .padding(.top, 12)
                 .padding(.trailing, 16)
         }
+        // The indicator he can learn to recognize (§8) belongs on his
+        // surface above all: with `childMode` persisted, the counter phone
+        // may sit on this screen for days. Shown only while capture runs,
+        // so the board stays uncluttered otherwise (§7).
+        .overlay(alignment: .topLeading) {
+            if env.capture.isListening {
+                RecordingIndicator(isListening: true)
+                    .padding(.top, 12)
+                    .padding(.leading, 16)
+            }
+        }
         .onAppear(perform: reload)
     }
 

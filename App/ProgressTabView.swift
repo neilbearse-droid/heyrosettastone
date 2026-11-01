@@ -101,7 +101,7 @@ struct ProgressTabView: View {
                     Text("What the model knows, word by word")
                 } footer: {
                     Text(env.suggestions.isModelAvailable
-                        ? "A word starts getting guessed once it has 5 confirmed clips from 3 different exchanges and the model recognizes its own examples reliably. More confirmations always help."
+                        ? maturityFooter
                         : "Guessing is off — no recognition model is bundled in this build. Every confirmation still counts; guesses appear the moment a model is added.")
                 }
             }
@@ -138,11 +138,21 @@ struct ProgressTabView: View {
             let pct = Int(((report.looTop3HitRate ?? 0) * 100).rounded())
             return "guessing live — recognizes \(pct)% of its own clips"
         }
-        let minimum = MaturityGate.Config().minExemplars
-        if report.exemplarCount < minimum {
-            return "learning — \(report.exemplarCount) of \(minimum) clips needed"
+        let config = MaturityGate.Config()
+        if report.exemplarCount < config.minExemplars {
+            return "learning — \(report.exemplarCount) of \(config.minExemplars) clips needed"
         }
-        return "needs clips from more separate exchanges before guessing"
+        if report.sessionCount < config.minSessions {
+            return "learning — heard in \(report.sessionCount) of \(config.minSessions) separate exchanges so far"
+        }
+        return "learning — needs a few more confirmations before guessing"
+    }
+
+    /// The gate's numbers, read from the config so the footer can never
+    /// drift from what the model actually requires.
+    private var maturityFooter: String {
+        let config = MaturityGate.Config()
+        return "A word starts getting guessed once it has \(config.minExemplars) confirmed clips from \(config.minSessions) different exchanges and the model recognizes its own examples reliably. More confirmations always help."
     }
 
     @ViewBuilder

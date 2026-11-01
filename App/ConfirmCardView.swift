@@ -55,7 +55,10 @@ struct ConfirmCardView: View {
             .navigationTitle("Confirm")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    RecordingIndicator(isListening: env.capture.isListening)
+                    RecordingIndicator(
+                        isListening: env.capture.isListening,
+                        isStopped: env.capture.lastError != nil
+                    )
                 }
             }
             .sheet(isPresented: $showingAskBoard) { askBoard }
@@ -297,6 +300,16 @@ struct ConfirmCardView: View {
     }
 
     private func confirm(_ intent: IntentRecord, with model: ConfirmViewModel) {
+        // A second tap on an already-saved card (double tap, or a stale
+        // button after the model was swapped) is silently ignored.
+        guard !model.resolved else { return }
+        // Rejection is final (§2.4): the model refuses a dismissed intent.
+        // The Ask board can still hand one in (he taps a word the parent
+        // ✕'d), so say why nothing happened instead of doing nothing.
+        guard !model.dismissedIntentIds.contains(intent.id) else {
+            showBanner("“\(intent.label)” was marked as a wrong guess this exchange, so it was not saved.", success: false)
+            return
+        }
         guard !model.selectedSegments.isEmpty else {
             showBanner("Tick at least one clip to save it as “\(intent.label)”", success: false)
             return
@@ -308,7 +321,15 @@ struct ConfirmCardView: View {
             showBanner("Could not save: \(error.localizedDescription)", success: false)
             return
         }
-        guard !created.isEmpty else { return }
+        guard !created.isEmpty else {
+            // The store skipped every selected clip (audio already deleted).
+            // The model is resolved now, so the card must not stay up dead.
+            showBanner("Nothing saved — those recordings are no longer on this phone.", success: false)
+            clearModel()
+            env.capture.clearRecentSegments()
+            reload()
+            return
+        }
 
         showBanner("Saved \(created.count) clip\(created.count == 1 ? "" : "s") as “\(intent.label)”", success: true)
         clearModel()
