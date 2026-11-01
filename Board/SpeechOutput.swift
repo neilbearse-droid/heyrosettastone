@@ -31,15 +31,44 @@ final class SpeechOutput: NSObject, AVSpeechSynthesizerDelegate {
     /// Thread-safe: read on the capture queue, written on the main thread.
     /// (A `let`, so the Observable macro leaves it alone.)
     private let selfSpeakingUntilLock = OSAllocatedUnfairLock(initialState: Date.distantPast)
+    /// Same, for stored-clip playback (ClipPlayer). Kept apart from the
+    /// synthesizer's gate so a word spoken while a clip plays, or a clip
+    /// stopped while a word is mid-utterance, cannot release the other.
+    private let playbackUntilLock = OSAllocatedUnfairLock(initialState: Date.distantPast)
 
-    /// Until this instant the phone is (or may still be) speaking. Capture
-    /// feeds silence into the session buffer while `Date() < selfSpeakingUntil`
-    /// so the board's own voice never becomes a segment. Set pessimistically
-    /// at `speak` (the synthesizer may take a few hundred ms to actually
-    /// start), then tightened to end-of-utterance + `selfSpeechTail` by the
-    /// delegate.
+    /// Until this instant the phone is (or may still be) producing sound of
+    /// its own: the board's voice, or a stored clip being played back.
+    /// Capture feeds silence into the session buffer while
+    /// `Date() < selfSpeakingUntil` so neither becomes a segment. The
+    /// speech gate is set pessimistically at `speak` (the synthesizer may
+    /// take a few hundred ms to actually start), then tightened to
+    /// end-of-utterance + `selfSpeechTail` by the delegate; the playback
+    /// gate is set from the clip's duration by `beginSelfPlayback`.
     var selfSpeakingUntil: Date {
-        selfSpeakingUntilLock.withLock { $0 }
+        let speech = selfSpeakingUntilLock.withLock { $0 }
+        let playback = playbackUntilLock.withLock { $0 }
+        return max(speech, playback)
+    }
+
+    /// The phone is about to play a stored clip for `duration` seconds — a
+    /// chip on the Confirm card, a row in Review, an exemplar in Dictionary.
+    /// Through the counter phone's speaker that is his own voice coming
+    /// back at the microphone: ungated it would be cut as a new utterance,
+    /// and if the exchange had already closed (the normal yes-moment
+    /// timing) it would open a new session and wipe the very card the
+    /// parent is labelling. Same gate as the board's voice. Also makes sure
+    /// the audio session can play when capture is off (the silent switch
+    /// would otherwise mute Review playback).
+    func beginSelfPlayback(duration: TimeInterval) {
+        ensurePlaybackCapableSession()
+        let until = Date().addingTimeInterval(max(0, duration) + Self.selfSpeechTail)
+        playbackUntilLock.withLock { $0 = max($0, until) }
+    }
+
+    /// Playback finished or was stopped early: release the playback gate
+    /// after the tail. The synthesizer's own gate is untouched.
+    func endSelfPlayback() {
+        playbackUntilLock.withLock { $0 = Date().addingTimeInterval(Self.selfSpeechTail) }
     }
 
     /// The utterance we most recently asked for. `stopSpeaking(at:)` on a

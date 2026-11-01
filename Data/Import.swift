@@ -147,7 +147,8 @@ enum RosettaImporter {
             summary.intents = Self.insertIgnoring(intents, db, skipped: &skipped)
             summary.sessions = Self.insertIgnoring(manifest.sessions, db, skipped: &skipped)
             summary.segments = Self.insertIgnoring(manifest.segments, db, skipped: &skipped)
-            summary.exemplars = Self.insertIgnoring(manifest.exemplars, db, skipped: &skipped)
+            let exemplars = Self.backfillingCaptureContext(manifest.exemplars, from: manifest)
+            summary.exemplars = Self.insertIgnoring(exemplars, db, skipped: &skipped)
             summary.negatives = Self.insertIgnoring(manifest.negatives, db, skipped: &skipped)
             summary.events = Self.insertIgnoring(manifest.events, db, skipped: &skipped)
             summary.calibrationObservations = Self.insertIgnoring(
@@ -181,6 +182,29 @@ enum RosettaImporter {
             }
             if let placedSlot = placed.boardSlot { occupied[placedSlot] = intent.id }
             return placed
+        }
+    }
+
+    /// What migration v3 does for an upgraded database, done for an export
+    /// made before v3 (format 1): an exemplar's `sessionId` and
+    /// `capturedAt` come from the manifest segment that shares its clip.
+    /// Without this a restored word's clips would each count as their own
+    /// exchange for maturity and the hour-of-day prior would see the
+    /// evening labelling time instead of when he said it. A format-2
+    /// export already carries both; only a nil `sessionId` is filled in.
+    static func backfillingCaptureContext(_ exemplars: [ExemplarRecord],
+                                          from manifest: RosettaExporter.ExportManifest) -> [ExemplarRecord] {
+        var byClip: [String: SegmentRecord] = [:]
+        for segment in manifest.segments where !FileLocations.isDeleted(clipRef: segment.clipRef) {
+            if byClip[segment.clipRef] == nil { byClip[segment.clipRef] = segment }
+        }
+        let preV3 = manifest.formatVersion < 2
+        return exemplars.map { exemplar in
+            guard let segment = byClip[exemplar.clipRef] else { return exemplar }
+            var patched = exemplar
+            if patched.sessionId == nil { patched.sessionId = segment.sessionId }
+            if preV3 { patched.capturedAt = segment.startedAt }
+            return patched
         }
     }
 

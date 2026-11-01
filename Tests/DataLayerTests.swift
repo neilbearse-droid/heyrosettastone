@@ -150,6 +150,40 @@ final class DataLayerTests: XCTestCase {
         XCTAssertEqual(try segment("other")?.segmentState, .labelled)
     }
 
+    func testDeleteForeverRemovesThePhotoUnlessAnotherWordShowsIt() throws {
+        let fm = FileManager.default
+        let banana = IntentRecord(label: "banana", photoRef: "photo-banana")
+        let snack = IntentRecord(label: "snack", photoRef: "photo-shared")
+        let hungry = IntentRecord(label: "hungry", photoRef: "photo-shared")
+        for intent in [banana, snack, hungry] { try IntentStore(db: db).insert(intent) }
+        try Data([1]).write(to: FileLocations.photoURL(id: "photo-banana"))
+        try Data([2]).write(to: FileLocations.photoURL(id: "photo-shared"))
+
+        XCTAssertEqual(try IntentStore(db: db).deleteForever(id: banana.id, now: now), "photo-banana")
+        XCTAssertFalse(fm.fileExists(atPath: FileLocations.photoURL(id: "photo-banana").path), "his banana's photo goes with the word (§8)")
+
+        XCTAssertNil(try IntentStore(db: db).deleteForever(id: snack.id, now: now), "hungry still shows that photo")
+        XCTAssertTrue(fm.fileExists(atPath: FileLocations.photoURL(id: "photo-shared").path))
+    }
+
+    func testOrphanPhotoSweepKeepsReferencedAndFreshFiles() throws {
+        let fm = FileManager.default
+        try IntentStore(db: db).insert(IntentRecord(label: "banana", photoRef: "kept"))
+        try IntentStore(db: db).insert(IntentRecord(label: "old", photoRef: "kept-archived", archivedAt: now))
+        for ref in ["kept", "kept-archived", "replaced", "fresh"] {
+            try Data([1]).write(to: FileLocations.photoURL(id: ref))
+            try fm.setAttributes([.modificationDate: now.addingTimeInterval(-3600)],
+                                 ofItemAtPath: FileLocations.photoURL(id: ref).path)
+        }
+        try fm.setAttributes([.modificationDate: now], ofItemAtPath: FileLocations.photoURL(id: "fresh").path)
+
+        XCTAssertEqual(try Maintenance.sweepOrphanPhotos(db: db, now: now), 1)
+        XCTAssertFalse(fm.fileExists(atPath: FileLocations.photoURL(id: "replaced").path))
+        XCTAssertTrue(fm.fileExists(atPath: FileLocations.photoURL(id: "kept").path))
+        XCTAssertTrue(fm.fileExists(atPath: FileLocations.photoURL(id: "kept-archived").path), "an archived word keeps its photo")
+        XCTAssertTrue(fm.fileExists(atPath: FileLocations.photoURL(id: "fresh").path), "may be a photo taken for a word still being typed")
+    }
+
     func testDiscardWithDeleteClipRemovesFileAndTombstones() throws {
         try addSession(id: "s", startedAt: now)
         try addSegment(id: "keep", sessionId: "s", startedAt: now)
@@ -453,6 +487,39 @@ final class DataLayerTests: XCTestCase {
         try RosettaExporter(db: db).wipeAll()
         XCTAssertEqual(try RosettaImporter.importSync(
             from: staging.appendingPathComponent("rosetta.json"), into: db).intents, 1)
+    }
+
+    func testImportOfPreV3ExportBackfillsSessionAndCaptureTimeFromItsSegments() throws {
+        let banana = IntentRecord(label: "banana")
+        let captured = now.addingTimeInterval(-13 * 3600)
+        let confirmed = now
+        let session = SessionRecord(id: "s", startedAt: captured, endedAt: captured.addingTimeInterval(20), device: "Kitchen")
+        let segment = SegmentRecord(id: "g", sessionId: "s", clipRef: "clip-g", startedAt: captured,
+                                    durationMs: 700, state: .labelled, labelledAt: confirmed)
+        // What a format-1 manifest decodes to: no sessionId, capturedAt == timestamp.
+        let json = """
+        {"id":"e","intentId":"\(banana.id)","clipRef":"clip-g","device":"Kitchen","contextJSON":"{}",
+         "labeller":"Mom","timestamp":"\(ISO8601DateFormatter().string(from: confirmed))","decayExempt":false}
+        """
+        let old = try RosettaExporter.makeJSONDecoder().decode(ExemplarRecord.self, from: Data(json.utf8))
+        let orphan = ExemplarRecord(id: "orphan", intentId: banana.id, clipRef: "clip-gone",
+                                    device: "Kitchen", labeller: "Mom", timestamp: confirmed)
+        var manifest = RosettaExporter.ExportManifest(
+            exportedAt: now, intents: [banana], exemplars: [old, orphan], negatives: [], events: [],
+            sessions: [session], segments: [segment])
+        manifest.formatVersion = 1
+
+        let summary = try RosettaImporter.mergeRows(manifest, into: db)
+        XCTAssertEqual(summary.exemplars, 2)
+
+        let restored = try XCTUnwrap(db.dbQueue.read { try ExemplarRecord.fetchOne($0, key: "e") })
+        XCTAssertEqual(restored.sessionId, "s", "maturity can hold out the whole exchange")
+        assertSameInstant(restored.capturedAt, captured, "hour-of-day prior sees when he said it, not the evening label")
+        assertSameInstant(restored.timestamp, confirmed)
+
+        let restoredOrphan = try XCTUnwrap(db.dbQueue.read { try ExemplarRecord.fetchOne($0, key: "orphan") })
+        XCTAssertNil(restoredOrphan.sessionId, "no segment in the export: left as it was")
+        assertSameInstant(restoredOrphan.capturedAt, confirmed)
     }
 
     func testZipImportIsRefusedWithPlainLanguage() throws {

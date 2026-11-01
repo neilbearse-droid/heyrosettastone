@@ -162,7 +162,9 @@ struct IntentDetailView: View {
         .alert("Delete “\(intent?.label ?? "")”?", isPresented: $confirmingDelete) {
             Button("Delete forever", role: .destructive) {
                 player.stop()
-                try? env.intents.deleteForever(id: intentId)
+                if let removedPhoto = try? env.intents.deleteForever(id: intentId) {
+                    PhotoCache.shared.invalidate(ref: removedPhoto)
+                }
                 let suggestions = env.suggestions
                 Task { await suggestions.reload() }
                 onChange()

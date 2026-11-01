@@ -60,6 +60,25 @@ final class ConfirmViewModel {
         self.exemplarStore = ExemplarStore(db: db)
         self.sessionStore = SessionStore(db: db)
         self.eventLog = EventLog(db: db)
+        // Rejection is final (§2.4) across the life of the exchange, not of
+        // this object: the card is rebuilt when the parent comes back from
+        // his board or the app relaunches, and the negatives table is where
+        // earlier dismissals live. Seed from it so a dismissed guess never
+        // reappears in the grid or the pinned board taps.
+        self.dismissedIntentIds = Self.storedDismissals(exchangeId: exchangeId, db: db)
+    }
+
+    /// Intents already rejected in this exchange, from the negatives table.
+    private static func storedDismissals(exchangeId: String?, db: AppDatabase) -> Set<String> {
+        guard let exchangeId else { return [] }
+        let ids = (try? db.dbQueue.read { db in
+            try String.fetchAll(
+                db,
+                sql: "SELECT DISTINCT rejectedIntentId FROM negatives WHERE exchangeId = ?",
+                arguments: [exchangeId]
+            )
+        }) ?? []
+        return Set(ids)
     }
 
     var selectedSegments: [SegmentRecord] {

@@ -186,6 +186,27 @@ final class ConfirmFlowTests: XCTestCase {
         XCTAssertEqual(forFirst?.embedding, Data([1, 2, 3, 4]))
     }
 
+    func testDismissalSurvivesTheCardBeingRebuilt() throws {
+        // Parent ✕'s outside, then walks him to his board: ParentTabView is
+        // torn down and the card is rebuilt from capture's chips when they
+        // come back. Rejection is final for the exchange (§2.4), not for
+        // one view-model instance.
+        let first = makeModel()
+        first.dismiss(intentId: outside.id)
+
+        let rebuilt = makeModel()
+        XCTAssertTrue(rebuilt.dismissedIntentIds.contains(outside.id), "seeded from the exchange's negatives")
+        let candidates = rebuilt.candidates(from: try IntentStore(db: db).all(), counts: [:])
+        XCTAssertFalse(candidates.contains { $0.id == outside.id })
+        XCTAssertTrue(try rebuilt.confirm(intentId: outside.id).isEmpty, "still refused on the rebuilt card")
+
+        // Another exchange is unaffected.
+        let other = ConfirmViewModel(
+            segments: [], exchangeId: "session-2", exchangeOpenedAt: openedAt,
+            device: "Kitchen", labeller: "Mom", db: db)
+        XCTAssertTrue(other.dismissedIntentIds.isEmpty)
+    }
+
     // MARK: - D6: a clip resolved elsewhere leaves the card
 
     func testSegmentLabelledInReviewCannotBeLabelledTwice() throws {

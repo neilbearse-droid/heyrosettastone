@@ -56,11 +56,17 @@ struct IntentStore {
     /// "Delete this word and its clips" (§8 full local deletion). Deletes
     /// the intent row (cascading exemplars, negatives and calibration
     /// observations), tombstones the segment rows that shared those clips
-    /// as discarded, and removes the clip files from disk. The only clip
-    /// kept is one that another intent's exemplar still references, which
-    /// would otherwise leave that exemplar without audio.
-    func deleteForever(id: String, now: Date = Date()) throws {
-        let clipsToRemove: [String] = try db.dbQueue.write { db in
+    /// as discarded, and removes the clip files — and the word's photo —
+    /// from disk. The only clip kept is one that another intent's exemplar
+    /// still references, which would otherwise leave that exemplar without
+    /// audio; likewise a photo another intent still shows. Returns the
+    /// photo ref whose file was removed (nil if none) so the caller can
+    /// drop it from `PhotoCache`.
+    @discardableResult
+    func deleteForever(id: String, now: Date = Date()) throws -> String? {
+        let (clipsToRemove, photoToRemove): ([String], String?) = try db.dbQueue.write { db in
+            let photoRef = try String.fetchOne(
+                db, sql: "SELECT photoRef FROM intents WHERE id = ?", arguments: [id])
             let refs = try String.fetchAll(
                 db,
                 sql: "SELECT DISTINCT clipRef FROM exemplars WHERE intentId = ?",
@@ -75,11 +81,24 @@ struct IntentStore {
                 try ClipTombstone.tombstoneSegments(db, clipRef: ref, state: .discarded, at: now)
                 removable.append(ref)
             }
-            return removable
+            var removablePhoto: String?
+            if let photoRef {
+                let photoStillShown = try Int.fetchOne(
+                    db, sql: "SELECT COUNT(*) FROM intents WHERE photoRef = ?", arguments: [photoRef]) ?? 0
+                if photoStillShown == 0 { removablePhoto = photoRef }
+            }
+            return (removable, removablePhoto)
         }
         for ref in clipsToRemove {
             ClipTombstone.removeFile(clipRef: ref)
         }
+        if let photoToRemove {
+            let url = FileLocations.photoURL(id: photoToRemove)
+            if FileManager.default.fileExists(atPath: url.path) {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        return photoToRemove
     }
 }
 

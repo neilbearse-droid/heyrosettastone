@@ -27,11 +27,13 @@ enum Maintenance {
         var temporaryFilesRemoved = 0
         var orphanClipsRemoved = 0
         var retentionClipsRemoved = 0
+        var orphanPhotosRemoved = 0
     }
 
     /// Runs every sweep in order and finishes with `PRAGMA optimize`:
     /// Review expiry (24 h), open-session close, `.tmp` partial clips,
-    /// retention (7 d) for discarded / not-him audio, then row-less clips.
+    /// retention (7 d) for discarded / not-him audio, row-less clips, then
+    /// photos no intent shows any more.
     @discardableResult
     static func runAtLaunch(db: AppDatabase, now: Date = Date()) throws -> Report {
         var report = Report()
@@ -40,6 +42,7 @@ enum Maintenance {
         report.temporaryFilesRemoved = sweepTemporaryFiles(in: FileLocations.clips)
         report.retentionClipsRemoved = try retentionSweep(db: db, now: now)
         report.orphanClipsRemoved = try sweepOrphanClips(db: db, now: now)
+        report.orphanPhotosRemoved = try sweepOrphanPhotos(db: db, now: now)
         try db.dbQueue.write { db in
             try db.execute(sql: "PRAGMA optimize")
         }
@@ -104,6 +107,35 @@ enum Maintenance {
         let graceCutoff = now.addingTimeInterval(-orphanGrace)
         var removed = 0
         for file in files where file.pathExtension.lowercased() == "m4a" {
+            let ref = file.deletingPathExtension().lastPathComponent
+            if referenced.contains(ref) { continue }
+            let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            if let modified, modified > graceCutoff { continue }
+            if (try? fm.removeItem(at: file)) != nil { removed += 1 }
+        }
+        return removed
+    }
+
+    /// Deletes photo files no intent (archived ones included) references:
+    /// a photo replaced in the editor, or taken during setup for a word
+    /// that was never added before the app was killed. Full local deletion
+    /// (§8) covers his objects' photos as much as his voice. Files modified
+    /// within `orphanGrace` are left alone, as for clips. Returns the
+    /// number removed.
+    @discardableResult
+    static func sweepOrphanPhotos(db: AppDatabase, now: Date = Date()) throws -> Int {
+        let referenced: Set<String> = try db.dbQueue.read { db in
+            Set(try String.fetchAll(db, sql: "SELECT photoRef FROM intents WHERE photoRef IS NOT NULL"))
+        }
+
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(
+            at: FileLocations.photos, includingPropertiesForKeys: [.contentModificationDateKey]
+        ) else { return 0 }
+
+        let graceCutoff = now.addingTimeInterval(-orphanGrace)
+        var removed = 0
+        for file in files where file.pathExtension.lowercased() == "jpg" {
             let ref = file.deletingPathExtension().lastPathComponent
             if referenced.contains(ref) { continue }
             let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
