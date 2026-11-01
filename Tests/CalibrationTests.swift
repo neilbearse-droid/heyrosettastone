@@ -21,7 +21,7 @@ final class CalibrationTests: XCTestCase {
         // Accepts around z ≈ +1.5, rejects around z ≈ −0.5 — the kind of
         // separation the standardized feature produces for a word the
         // model knows.
-        let history: [(Double, Bool)] = [
+        let history: [(score: Double, accepted: Bool)] = [
             (1.3, true), (1.5, true), (1.7, true), (1.5, true),
             (-0.7, false), (-0.5, false), (-0.3, false), (-0.5, false),
         ]
@@ -31,7 +31,7 @@ final class CalibrationTests: XCTestCase {
     }
 
     func testRejectionTightensTheThreshold() {
-        let base: [(Double, Bool)] = [
+        let base: [(score: Double, accepted: Bool)] = [
             (1.5, true), (2.0, true), (2.5, true),
             (-0.5, false), (-0.3, false),
         ]
@@ -51,7 +51,7 @@ final class CalibrationTests: XCTestCase {
     }
 
     func testAcceptancesLoosenTheThreshold() {
-        let base: [(Double, Bool)] = [
+        let base: [(score: Double, accepted: Bool)] = [
             (2.0, true), (2.5, true),
             (-0.5, false), (-0.3, false),
         ]

@@ -59,12 +59,17 @@ enum VectorMath {
     /// §4.2 theory that he repeated the same intent through the no's.
     static func meanPooled(_ vectors: [[Float]]) -> [Float]? {
         guard let first = vectors.first else { return nil }
-        var sum = [Float](repeating: 0, count: first.count)
-        for vector in vectors where vector.count == first.count {
-            vDSP_vadd(sum, 1, vector, 1, &sum, 1, vDSP_Length(first.count))
+        let count = first.count
+        var sum = [Float](repeating: 0, count: count)
+        // In-place vDSP calls (same array as input and output) violate
+        // exclusivity; accumulate through a scratch buffer instead.
+        var scratch = [Float](repeating: 0, count: count)
+        for vector in vectors where vector.count == count {
+            vDSP_vadd(sum, 1, vector, 1, &scratch, 1, vDSP_Length(count))
+            swap(&sum, &scratch)
         }
         var divisor = Float(vectors.count)
-        vDSP_vsdiv(sum, 1, &divisor, &sum, 1, vDSP_Length(first.count))
-        return l2Normalized(sum)
+        vDSP_vsdiv(sum, 1, &divisor, &scratch, 1, vDSP_Length(count))
+        return l2Normalized(scratch)
     }
 }

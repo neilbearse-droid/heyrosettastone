@@ -129,8 +129,11 @@ final class SuggestionEngine {
         isModelAvailable = embedder != nil
         let db = self.db
         let cache = maturityCache
-        var maturityConfig = self.maturityConfig
-        maturityConfig.ranker = rankerConfig
+        // Copied into a `let` before the detached task: a captured `var`
+        // is rejected inside a @Sendable closure.
+        var pendingMaturityConfig = self.maturityConfig
+        pendingMaturityConfig.ranker = rankerConfig
+        let maturityConfig = pendingMaturityConfig
         let priorConfig = self.priorConfig
         let built = await Task.detached(priority: .utility) {
             Self.buildState(db: db, maturityCache: cache, maturityConfig: maturityConfig, priorConfig: priorConfig)
