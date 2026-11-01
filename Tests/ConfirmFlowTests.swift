@@ -220,7 +220,7 @@ final class ConfirmFlowTests: XCTestCase {
 
         var recorded: (shown: [Suggestion], confirmed: String, exchange: String?)?
         model.outcomeRecorder = { shown, confirmed, exchange in
-            recorded = (shown, confirmed, exchange)
+            recorded = (shown: shown, confirmed: confirmed, exchange: exchange)
         }
 
         _ = try model.confirm(intentId: banana.id)
@@ -236,7 +236,7 @@ final class ConfirmFlowTests: XCTestCase {
         model.topGuesses = [suggestion(outside, z: 0.9)]
 
         var recorded: (shown: [Suggestion], confirmed: String)?
-        model.outcomeRecorder = { shown, confirmed, _ in recorded = (shown, confirmed) }
+        model.outcomeRecorder = { shown, confirmed, _ in recorded = (shown: shown, confirmed: confirmed) }
 
         // Parent ignores the guess and picks banana from the grid (§4.5:
         // the model was wrong; that is the extra-valuable signal).

@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// The child's surface: a fixed grid of large photo buttons (§3, §7).
 /// Tapping speaks the label and logs a boardTap event. The grid renders

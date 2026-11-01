@@ -393,7 +393,7 @@ struct SettingsView: View {
         env.capture.clearRecentSegments()
         let exporter = env.exporter
         Task {
-            let failure: String? = await Task.detached(priority: .userInitiated) {
+            let failure: String? = await Task.detached(priority: .userInitiated) { () -> String? in
                 do {
                     try exporter.wipeAll()
                     return nil
