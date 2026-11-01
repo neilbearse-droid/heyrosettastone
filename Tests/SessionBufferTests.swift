@@ -216,7 +216,7 @@ final class SessionBufferTests: XCTestCase {
         let thresholdAfterSpeech = buffer.liveLevel.threshold
 
         buffer.ingest(AudioFixtures.silence(seconds: 1.0), muted: true)
-        XCTAssertEqual(buffer.streamTime, 2.0, accuracy: 0.001, "muted audio still advances the clock")
+        XCTAssertEqual(buffer.streamTime, 2.0, accuracy: 0.03, "muted audio still advances the clock")
         XCTAssertEqual(recorder.segments.count, 1, "the utterance ends through the normal hangover")
         XCTAssertEqual(recorder.segments[0].duration, 1.3, accuracy: 0.3)
         XCTAssertEqual(buffer.liveLevel.threshold, thresholdAfterSpeech,

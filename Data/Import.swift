@@ -179,7 +179,7 @@ enum RosettaImporter {
             if let holder = occupied[slot], holder != intent.id {
                 placed.boardSlot = BoardLayout.slotForNewIntent(occupiedSlots: Array(occupied.keys))
             }
-            if let final = placed.boardSlot { occupied[final] = intent.id }
+            if let placedSlot = placed.boardSlot { occupied[placedSlot] = intent.id }
             return placed
         }
     }
