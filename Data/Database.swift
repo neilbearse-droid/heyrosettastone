@@ -7,9 +7,18 @@ final class AppDatabase {
 
     /// On-disk database at FileLocations.databaseURL.
     static func open() throws -> AppDatabase {
-        try FileLocations.prepare()
+        // The Settings toggle persists here; passing it through is what
+        // keeps clips in (or out of) the backup across launches.
+        try FileLocations.prepare(
+            includeAudioInBackup: UserDefaults.standard.bool(forKey: "includeAudioInBackup")
+        )
         var config = Configuration()
         config.foreignKeysEnabled = true
+        // Full local deletion (§8): overwrite freed pages with zeros so a
+        // deleted label, embedding or event does not linger in the file.
+        config.prepareDatabase { db in
+            try db.execute(sql: "PRAGMA secure_delete = ON")
+        }
         let queue = try DatabaseQueue(path: FileLocations.databaseURL.path, configuration: config)
         return try AppDatabase(queue: queue)
     }
@@ -21,10 +30,13 @@ final class AppDatabase {
 
     init(queue: DatabaseQueue) throws {
         self.dbQueue = queue
-        try migrator.migrate(dbQueue)
+        try Self.migrator.migrate(dbQueue)
     }
 
-    private var migrator: DatabaseMigrator {
+    /// Exposed (not private) so tests can migrate a queue part-way with
+    /// `migrator.migrate(queue, upTo:)`, seed old-schema rows, and then
+    /// check what the later migrations do to them.
+    static var migrator: DatabaseMigrator {
         var migrator = DatabaseMigrator()
 
         migrator.registerMigration("v1") { db in
@@ -111,6 +123,40 @@ final class AppDatabase {
                 t.column("timestamp", .datetime).notNull()
             }
             try db.create(index: "calibration_intent", on: "calibrationObservations", columns: ["intentId"])
+        }
+
+        // v3: exemplars remember when and in which exchange the utterance
+        // was captured (hour-of-day prior must use capture time, maturity
+        // holds out whole sessions), plus the indexes the stores and the
+        // maintenance sweeps query on. Back-fills from the segment that
+        // shares the clip; falls back to the confirmation timestamp.
+        migrator.registerMigration("v3-capture-context") { db in
+            try db.alter(table: "exemplars") { t in
+                t.add(column: "sessionId", .text)
+                t.add(column: "capturedAt", .datetime)
+            }
+            try db.execute(sql: """
+                UPDATE exemplars SET capturedAt = (
+                    SELECT s.startedAt FROM segments s
+                    WHERE s.clipRef = exemplars.clipRef
+                    LIMIT 1
+                )
+                WHERE capturedAt IS NULL
+                """)
+            try db.execute(sql: "UPDATE exemplars SET capturedAt = timestamp WHERE capturedAt IS NULL")
+            try db.execute(sql: """
+                UPDATE exemplars SET sessionId = (
+                    SELECT s.sessionId FROM segments s
+                    WHERE s.clipRef = exemplars.clipRef
+                    LIMIT 1
+                )
+                WHERE sessionId IS NULL
+                """)
+
+            try db.create(index: "segments_session", on: "segments", columns: ["sessionId"])
+            try db.create(index: "segments_clip", on: "segments", columns: ["clipRef"])
+            try db.create(index: "exemplars_clip", on: "exemplars", columns: ["clipRef"])
+            try db.create(index: "negatives_intent", on: "negatives", columns: ["rejectedIntentId"])
         }
 
         return migrator

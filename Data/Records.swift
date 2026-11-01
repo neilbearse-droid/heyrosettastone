@@ -50,7 +50,8 @@ struct ExemplarRecord: Codable, Identifiable, Equatable, FetchableRecord, Persis
 
     var id: String
     var intentId: String
-    /// Clip file id under FileLocations.clips.
+    /// Clip file id under FileLocations.clips. `FileLocations.deletedClipRef`
+    /// once the audio has been deleted (the row is then a tombstone).
     var clipRef: String
     /// Embedding vector, Phase 2. Nil until the embedding pipeline exists;
     /// Phase 2 backfills from clipRef.
@@ -62,8 +63,18 @@ struct ExemplarRecord: Codable, Identifiable, Equatable, FetchableRecord, Persis
     var contextJSON: String
     /// Who confirmed it (§12: labeller ids mean something).
     var labeller: String
+    /// When the family confirmed it. Use `capturedAt` for anything about
+    /// when he actually said it (hour-of-day prior, recency).
     var timestamp: Date
     var decayExempt: Bool
+    /// The exchange session the clip was captured in (v3). Lets maturity
+    /// evaluation hold out whole sessions rather than single near-duplicate
+    /// chips. Nil only for rows that predate v3 and whose segment is gone.
+    var sessionId: String?
+    /// When the utterance was captured (segment.startedAt), as opposed to
+    /// when it was labelled (`timestamp`). Evening Review labelling must not
+    /// make every word look like an 8 pm word (§5.3).
+    var capturedAt: Date
 
     init(id: String = UUID().uuidString,
          intentId: String,
@@ -73,7 +84,9 @@ struct ExemplarRecord: Codable, Identifiable, Equatable, FetchableRecord, Persis
          contextJSON: String = "{}",
          labeller: String,
          timestamp: Date = Date(),
-         decayExempt: Bool = false) {
+         decayExempt: Bool = false,
+         sessionId: String? = nil,
+         capturedAt: Date? = nil) {
         self.id = id
         self.intentId = intentId
         self.clipRef = clipRef
@@ -83,6 +96,31 @@ struct ExemplarRecord: Codable, Identifiable, Equatable, FetchableRecord, Persis
         self.labeller = labeller
         self.timestamp = timestamp
         self.decayExempt = decayExempt
+        self.sessionId = sessionId
+        self.capturedAt = capturedAt ?? timestamp
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, intentId, clipRef, embedding, device, contextJSON, labeller
+        case timestamp, decayExempt, sessionId, capturedAt
+    }
+
+    /// Tolerant decoding: a pre-v3 export (or a NULL column) has no
+    /// `sessionId` / `capturedAt`; fall back to the confirmation time so old
+    /// backups still import. `encode(to:)` stays synthesized.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        intentId = try c.decode(String.self, forKey: .intentId)
+        clipRef = try c.decode(String.self, forKey: .clipRef)
+        embedding = try c.decodeIfPresent(Data.self, forKey: .embedding)
+        device = try c.decode(String.self, forKey: .device)
+        contextJSON = try c.decode(String.self, forKey: .contextJSON)
+        labeller = try c.decode(String.self, forKey: .labeller)
+        timestamp = try c.decode(Date.self, forKey: .timestamp)
+        decayExempt = try c.decode(Bool.self, forKey: .decayExempt)
+        sessionId = try c.decodeIfPresent(String.self, forKey: .sessionId)
+        capturedAt = try c.decodeIfPresent(Date.self, forKey: .capturedAt) ?? timestamp
     }
 }
 
@@ -123,6 +161,11 @@ enum EventType: String, Codable {
     case reject
     case skip
     case boardTap
+    /// An exchange was displaced by the next one while its segments were
+    /// still pending (§2.9 abandoned-exchange rate). Logged by capture when
+    /// a session opens; `EventLog.abandonedRate` is computed from sessions
+    /// and segments, so the event is a marker, not the source of truth.
+    case abandon
 }
 
 /// The interaction log. Time-to-understanding and abandoned-exchange rate
@@ -198,11 +241,20 @@ enum SegmentState: String, Codable {
 }
 
 /// One VAD-detected utterance, persisted with its clip.
+///
+/// Never call `update(db)` on an in-memory copy of this record: the capture
+/// path writes `embedding` asynchronously after insert, so a snapshot held
+/// by a view is stale and a full-row update would erase it. Every store
+/// method updates the specific columns it owns with a scoped UPDATE
+/// instead (see SessionStore / SegmentStore / ExemplarStore.confirm).
 struct SegmentRecord: Codable, Identifiable, Equatable, FetchableRecord, PersistableRecord {
     static let databaseTableName = "segments"
 
     var id: String
     var sessionId: String
+    /// Clip file id under FileLocations.clips. `FileLocations.deletedClipRef`
+    /// once the audio was deleted (discard, prune, retention sweep); the row
+    /// stays as a tombstone so counts and history survive.
     var clipRef: String
     var startedAt: Date
     var durationMs: Int
@@ -231,6 +283,9 @@ struct SegmentRecord: Codable, Identifiable, Equatable, FetchableRecord, Persist
     }
 
     var segmentState: SegmentState? { SegmentState(rawValue: state) }
+
+    /// True once the clip file has been deleted and the row is a tombstone.
+    var isClipDeleted: Bool { FileLocations.isDeleted(clipRef: clipRef) }
 }
 
 // MARK: - Calibration observation

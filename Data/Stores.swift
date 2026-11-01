@@ -1,6 +1,12 @@
 import Foundation
 import GRDB
 
+// Store discipline: a record handed in by a caller is a snapshot and may be
+// stale (the capture path writes `segments.embedding` asynchronously after
+// insert). Stores therefore never `update(db)` a caller-supplied record;
+// they update the specific columns they own with a scoped UPDATE, and
+// re-fetch inside the write transaction when they need current values.
+
 // MARK: - Intents
 
 struct IntentStore {
@@ -28,51 +34,51 @@ struct IntentStore {
     /// boardSlot — slot changes go through BoardLayout only (§2.3).
     func updateDetails(id: String, label: String, photoRef: String?, respondNote: String?) throws {
         try db.dbQueue.write { db in
-            guard var intent = try IntentRecord.fetchOne(db, key: id) else { return }
-            intent.label = label
-            intent.photoRef = photoRef
-            intent.respondNote = respondNote
-            try intent.update(db)
+            try db.execute(
+                sql: "UPDATE intents SET label = ?, photoRef = ?, respondNote = ? WHERE id = ?",
+                arguments: [label, photoRef, respondNote, id]
+            )
         }
     }
 
     /// Archive rather than delete: exemplars stay reviewable (§5.4 spirit).
     /// Hard deletion of an intent and its exemplars is available in
     /// Dictionary behind a confirmation.
-    func archive(id: String) throws {
+    func archive(id: String, at date: Date = Date()) throws {
         try db.dbQueue.write { db in
-            guard var intent = try IntentRecord.fetchOne(db, key: id) else { return }
-            intent.archivedAt = Date()
-            intent.boardSlot = nil
-            try intent.update(db)
+            try db.execute(
+                sql: "UPDATE intents SET archivedAt = ?, boardSlot = NULL WHERE id = ?",
+                arguments: [date, id]
+            )
         }
     }
 
-    func deleteForever(id: String) throws {
-        let clips: [String] = try db.dbQueue.write { db in
+    /// "Delete this word and its clips" (§8 full local deletion). Deletes
+    /// the intent row (cascading exemplars, negatives and calibration
+    /// observations), tombstones the segment rows that shared those clips
+    /// as discarded, and removes the clip files from disk. The only clip
+    /// kept is one that another intent's exemplar still references, which
+    /// would otherwise leave that exemplar without audio.
+    func deleteForever(id: String, now: Date = Date()) throws {
+        let clipsToRemove: [String] = try db.dbQueue.write { db in
             let refs = try String.fetchAll(
                 db,
-                sql: "SELECT clipRef FROM exemplars WHERE intentId = ?",
+                sql: "SELECT DISTINCT clipRef FROM exemplars WHERE intentId = ?",
                 arguments: [id]
             )
             _ = try IntentRecord.deleteOne(db, key: id) // cascades exemplars, negatives
-            return refs
-        }
-        // Only remove clip files no longer referenced by any segment or exemplar.
-        for ref in clips {
-            if (try? isClipReferenced(ref)) == false {
-                try? FileManager.default.removeItem(at: FileLocations.clipURL(id: ref))
+            var removable: [String] = []
+            for ref in refs where !FileLocations.isDeleted(clipRef: ref) {
+                let stillReferenced = try Int.fetchOne(
+                    db, sql: "SELECT COUNT(*) FROM exemplars WHERE clipRef = ?", arguments: [ref]) ?? 0
+                guard stillReferenced == 0 else { continue }
+                try ClipTombstone.tombstoneSegments(db, clipRef: ref, state: .discarded, at: now)
+                removable.append(ref)
             }
+            return removable
         }
-    }
-
-    private func isClipReferenced(_ ref: String) throws -> Bool {
-        try db.dbQueue.read { db in
-            let inExemplars = try Int.fetchOne(
-                db, sql: "SELECT COUNT(*) FROM exemplars WHERE clipRef = ?", arguments: [ref]) ?? 0
-            let inSegments = try Int.fetchOne(
-                db, sql: "SELECT COUNT(*) FROM segments WHERE clipRef = ?", arguments: [ref]) ?? 0
-            return inExemplars + inSegments > 0
+        for ref in clipsToRemove {
+            ClipTombstone.removeFile(clipRef: ref)
         }
     }
 }
@@ -86,6 +92,12 @@ struct ExemplarStore {
     /// caller is an explicit human confirmation: the Confirm card, the Review
     /// queue, or the Ask flow. Each selected segment becomes one exemplar and
     /// the segment is flagged labelled.
+    ///
+    /// The segments passed in are treated as a list of ids: each one is
+    /// re-fetched inside the transaction so the exemplar carries the
+    /// embedding the capture path persisted after the caller's snapshot was
+    /// taken, and only `state` / `labelledAt` are written on the segment row.
+    /// A segment whose clip has since been deleted (tombstone) is skipped.
     func confirm(segments: [SegmentRecord],
                  intentId: String,
                  device: String,
@@ -93,29 +105,34 @@ struct ExemplarStore {
                  now: Date = Date()) throws -> [ExemplarRecord] {
         try db.dbQueue.write { db in
             var created: [ExemplarRecord] = []
-            for segment in segments {
+            for snapshot in segments {
+                let fresh = try SegmentRecord.fetchOne(db, key: snapshot.id) ?? snapshot
+                guard !fresh.isClipDeleted else { continue }
+
                 let context: [String: String] = [
-                    "sessionId": segment.sessionId,
-                    "hourOfDay": String(Calendar.current.component(.hour, from: segment.startedAt)),
+                    "sessionId": fresh.sessionId,
+                    "hourOfDay": String(Calendar.current.component(.hour, from: fresh.startedAt)),
                     "station": device,
                 ]
                 let contextJSON = String(
                     data: try JSONEncoder().encode(context), encoding: .utf8) ?? "{}"
                 let exemplar = ExemplarRecord(
                     intentId: intentId,
-                    clipRef: segment.clipRef,
-                    embedding: segment.embedding,
+                    clipRef: fresh.clipRef,
+                    embedding: fresh.embedding ?? snapshot.embedding,
                     device: device,
                     contextJSON: contextJSON,
                     labeller: labeller,
-                    timestamp: now
+                    timestamp: now,
+                    sessionId: fresh.sessionId,
+                    capturedAt: fresh.startedAt
                 )
                 try exemplar.insert(db)
 
-                var updated = segment
-                updated.state = SegmentState.labelled.rawValue
-                updated.labelledAt = now
-                try updated.update(db)
+                try db.execute(
+                    sql: "UPDATE segments SET state = ?, labelledAt = ? WHERE id = ?",
+                    arguments: [SegmentState.labelled.rawValue, now, fresh.id]
+                )
                 created.append(exemplar)
             }
             return created
@@ -142,8 +159,24 @@ struct ExemplarStore {
     }
 
     /// Pruning one mislabelled clip without corrupting the class (§5.2).
-    func delete(id: String) throws {
-        try db.dbQueue.write { _ = try ExemplarRecord.deleteOne($0, key: id) }
+    /// With `deleteClip`, the audio file is removed too (unless another
+    /// exemplar still references it) and the segment row that shares the
+    /// clip is tombstoned as discarded.
+    func delete(id: String, deleteClip: Bool = false, now: Date = Date()) throws {
+        let clipToRemove: String? = try db.dbQueue.write { db in
+            guard let exemplar = try ExemplarRecord.fetchOne(db, key: id) else { return nil }
+            _ = try ExemplarRecord.deleteOne(db, key: id)
+            guard deleteClip, !FileLocations.isDeleted(clipRef: exemplar.clipRef) else { return nil }
+            let stillReferenced = try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM exemplars WHERE clipRef = ?",
+                arguments: [exemplar.clipRef]) ?? 0
+            guard stillReferenced == 0 else { return nil }
+            try ClipTombstone.tombstoneSegments(db, clipRef: exemplar.clipRef, state: .discarded, at: now)
+            return exemplar.clipRef
+        }
+        if let clipToRemove {
+            ClipTombstone.removeFile(clipRef: clipToRemove)
+        }
     }
 
     func recordNegative(_ negative: NegativeRecord) throws {
@@ -162,9 +195,10 @@ struct SessionStore {
 
     func close(id: String, at date: Date) throws {
         try db.dbQueue.write { db in
-            guard var session = try SessionRecord.fetchOne(db, key: id) else { return }
-            session.endedAt = date
-            try session.update(db)
+            try db.execute(
+                sql: "UPDATE sessions SET endedAt = ? WHERE id = ?",
+                arguments: [date, id]
+            )
         }
     }
 
@@ -181,20 +215,111 @@ struct SessionStore {
         }
     }
 
+    /// Flips state only (clip kept). For discard / not-him with optional
+    /// clip deletion see `SegmentStore.resolve`, which this forwards to.
     func updateSegmentState(id: String, state: SegmentState, at date: Date = Date()) throws {
-        try db.dbQueue.write { db in
-            guard var segment = try SegmentRecord.fetchOne(db, key: id) else { return }
-            segment.state = state.rawValue
-            segment.labelledAt = (state == .labelled || state == .discarded || state == .notHim) ? date : nil
-            try segment.update(db)
-        }
+        try SegmentStore(db: db).resolve(id: id, state: state, deleteClip: false, at: date)
     }
 
     func updateSegmentEmbedding(id: String, embedding: Data) throws {
         try db.dbQueue.write { db in
-            guard var segment = try SegmentRecord.fetchOne(db, key: id) else { return }
-            segment.embedding = embedding
-            try segment.update(db)
+            try db.execute(
+                sql: "UPDATE segments SET embedding = ? WHERE id = ?",
+                arguments: [embedding, id]
+            )
+        }
+    }
+
+    // Conveniences so callers holding a SessionStore need not construct a
+    // SegmentStore.
+
+    func discard(id: String, deleteClip: Bool = false, at date: Date = Date()) throws {
+        try SegmentStore(db: db).discard(id: id, deleteClip: deleteClip, at: date)
+    }
+
+    func markNotHim(id: String, deleteClip: Bool = false, at date: Date = Date()) throws {
+        try SegmentStore(db: db).markNotHim(id: id, deleteClip: deleteClip, at: date)
+    }
+}
+
+/// Segment resolution: discard / not-him / plain state changes, with the
+/// option to delete the audio and keep the row as a tombstone.
+struct SegmentStore {
+    let db: AppDatabase
+
+    func fetch(id: String) throws -> SegmentRecord? {
+        try db.dbQueue.read { try SegmentRecord.fetchOne($0, key: id) }
+    }
+
+    /// Review "Discard": noise, TV, etc. With `deleteClip` the file goes
+    /// too and `clipRef` becomes `FileLocations.deletedClipRef`.
+    func discard(id: String, deleteClip: Bool = false, at date: Date = Date()) throws {
+        try resolve(id: id, state: .discarded, deleteClip: deleteClip, at: date)
+    }
+
+    /// Review "Not him": someone else's voice. Same deletion option.
+    func markNotHim(id: String, deleteClip: Bool = false, at date: Date = Date()) throws {
+        try resolve(id: id, state: .notHim, deleteClip: deleteClip, at: date)
+    }
+
+    /// Sets `state` (and `labelledAt` for resolved states) with a
+    /// column-scoped UPDATE. When `deleteClip` is true and no exemplar still
+    /// references the clip, the row is tombstoned and the file removed
+    /// after the transaction commits. Nothing else on the row is touched.
+    func resolve(id: String, state: SegmentState, deleteClip: Bool, at date: Date = Date()) throws {
+        let resolved = state == .labelled || state == .discarded || state == .notHim
+        let labelledAt: Date? = resolved ? date : nil
+        let clipToRemove: String? = try db.dbQueue.write { db in
+            guard let segment = try SegmentRecord.fetchOne(db, key: id) else { return nil }
+            try db.execute(
+                sql: "UPDATE segments SET state = ?, labelledAt = ? WHERE id = ?",
+                arguments: [state.rawValue, labelledAt, id]
+            )
+            guard deleteClip, !segment.isClipDeleted else { return nil }
+            let stillReferenced = try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM exemplars WHERE clipRef = ?",
+                arguments: [segment.clipRef]) ?? 0
+            guard stillReferenced == 0 else { return nil }
+            try ClipTombstone.tombstoneSegments(db, clipRef: segment.clipRef, state: state, at: date)
+            return segment.clipRef
+        }
+        if let clipToRemove {
+            ClipTombstone.removeFile(clipRef: clipToRemove)
+        }
+    }
+}
+
+/// Shared tombstone mechanics for every deletion path. Rows are kept, the
+/// clipRef is replaced by the sentinel, and the file is removed outside
+/// the transaction (a failed unlink is retried by Maintenance's orphan
+/// sweep, since the row no longer references the file).
+enum ClipTombstone {
+    /// Marks every segment row sharing `clipRef` as `state` (the caller's
+    /// resolution: discarded for prune / delete-forever, the chosen state
+    /// for Review) with the clip deleted, and blanks the clipRef on any
+    /// exemplar row that still points at it (there should be none; the
+    /// callers check first).
+    static func tombstoneSegments(_ db: Database, clipRef: String, state: SegmentState, at date: Date) throws {
+        guard !FileLocations.isDeleted(clipRef: clipRef) else { return }
+        try db.execute(
+            sql: """
+                UPDATE segments
+                SET clipRef = ?, state = ?, labelledAt = ?
+                WHERE clipRef = ?
+                """,
+            arguments: [FileLocations.deletedClipRef, state.rawValue, date, clipRef]
+        )
+        try db.execute(
+            sql: "UPDATE exemplars SET clipRef = ? WHERE clipRef = ?",
+            arguments: [FileLocations.deletedClipRef, clipRef]
+        )
+    }
+
+    static func removeFile(clipRef: String) {
+        guard !FileLocations.isDeleted(clipRef: clipRef) else { return }
+        let url = FileLocations.clipURL(id: clipRef)
+        if FileManager.default.fileExists(atPath: url.path) {
+            try? FileManager.default.removeItem(at: url)
         }
     }
 }
@@ -249,13 +374,18 @@ struct ReviewQueue {
         }
     }
 
-    func sweepExpired(now: Date = Date()) throws {
+    /// Also run at launch (Maintenance) and on session open (capture), so
+    /// the Confirm card and live guesses never operate on stale segments.
+    /// Returns the number of segments flipped.
+    @discardableResult
+    func sweepExpired(now: Date = Date()) throws -> Int {
         let cutoff = now.addingTimeInterval(-Self.expiryInterval)
-        try db.dbQueue.write { db in
+        return try db.dbQueue.write { db in
             try db.execute(
                 sql: "UPDATE segments SET state = ? WHERE state = ? AND startedAt < ?",
                 arguments: [SegmentState.expired.rawValue, SegmentState.pending.rawValue, cutoff]
             )
+            return db.changesCount
         }
     }
 }
@@ -290,33 +420,107 @@ struct EventLog {
         }
     }
 
-    /// Median ms from exchange open to confirm, per day — the §2.9 success
-    /// metric, shown as a trend in Progress.
-    func confirmLatencies(since: Date) throws -> [(day: Date, medianMs: Int)] {
+    /// Median ms from exchange open to confirm, per local calendar day —
+    /// the §2.9 success metric, shown as a trend in Progress. Bucketing is
+    /// done in Swift with `Calendar.current` so an evening confirmation in
+    /// North America lands on today, not UTC-tomorrow.
+    func confirmLatencies(since: Date, calendar: Calendar = .current) throws -> [(day: Date, medianMs: Int)] {
+        let rows: [(Date, Int)] = try db.dbQueue.read { db in
+            let fetched = try Row.fetchAll(
+                db,
+                sql: """
+                SELECT timestamp, latencyMs FROM events
+                WHERE type = ? AND latencyMs IS NOT NULL AND timestamp >= ?
+                """,
+                arguments: [EventType.confirm.rawValue, since]
+            )
+            return fetched.compactMap { row -> (Date, Int)? in
+                guard let timestamp: Date = row["timestamp"], let ms: Int = row["latencyMs"] else { return nil }
+                return (timestamp, ms)
+            }
+        }
+        var byDay: [Date: [Int]] = [:]
+        for (timestamp, ms) in rows {
+            byDay[calendar.startOfDay(for: timestamp), default: []].append(ms)
+        }
+        return byDay
+            .map { day, values -> (day: Date, medianMs: Int) in
+                let sorted = values.sorted()
+                return (day: day, medianMs: sorted[sorted.count / 2])
+            }
+            .sorted { $0.day < $1.day }
+    }
+
+    /// §2.9 abandoned-exchange rate. Among sessions started since `since`
+    /// that captured at least one segment, the fraction that were never
+    /// resolved: no confirm event carries the session id as its exchangeId,
+    /// and none of its segments was labelled within 24 h of the session
+    /// opening (the Review expiry window). Sessions younger than 24 h that
+    /// are still unresolved are undecided and excluded from both sides.
+    /// Nil when there is nothing to measure.
+    func abandonedRate(since: Date, now: Date = Date()) throws -> Double? {
+        let outcomes = try exchangeOutcomes(since: since, now: now)
+        let total = outcomes.resolved + outcomes.abandoned
+        guard total > 0 else { return nil }
+        return Double(outcomes.abandoned) / Double(total)
+    }
+
+    /// The counts behind `abandonedRate`, for a positively framed Progress
+    /// card ("exchanges that got there: 41 of 48").
+    func exchangeOutcomes(since: Date, now: Date = Date()) throws -> (resolved: Int, abandoned: Int) {
         try db.dbQueue.read { db in
             let rows = try Row.fetchAll(
                 db,
                 sql: """
-                SELECT date(timestamp) AS day, latencyMs FROM events
-                WHERE type = ? AND latencyMs IS NOT NULL AND timestamp >= ?
-                ORDER BY day
+                SELECT s.id AS id, s.startedAt AS startedAt,
+                    EXISTS (
+                        SELECT 1 FROM events e
+                        WHERE e.exchangeId = s.id AND e.type = ?
+                    ) AS confirmed,
+                    (
+                        SELECT MIN(g.labelledAt) FROM segments g
+                        WHERE g.sessionId = s.id AND g.state = ?
+                    ) AS firstLabelledAt,
+                    EXISTS (
+                        SELECT 1 FROM segments g
+                        WHERE g.sessionId = s.id AND g.state = ?
+                    ) AS hasPending
+                FROM sessions s
+                WHERE s.startedAt >= ?
+                  AND EXISTS (SELECT 1 FROM segments g WHERE g.sessionId = s.id)
                 """,
-                arguments: [EventType.confirm.rawValue, since]
+                arguments: [
+                    EventType.confirm.rawValue,
+                    SegmentState.labelled.rawValue,
+                    SegmentState.pending.rawValue,
+                    since,
+                ]
             )
-            var byDay: [String: [Int]] = [:]
+            var resolved = 0
+            var abandoned = 0
             for row in rows {
-                guard let day: String = row["day"], let ms: Int = row["latencyMs"] else { continue }
-                byDay[day, default: []].append(ms)
+                guard let startedAt: Date = row["startedAt"] else { continue }
+                let confirmed: Bool = row["confirmed"] ?? false
+                let firstLabelledAt: Date? = row["firstLabelledAt"]
+                let hasPending: Bool = row["hasPending"] ?? false
+                let window = startedAt.addingTimeInterval(ReviewQueue.expiryInterval)
+
+                let labelledInTime: Bool
+                if let firstLabelledAt {
+                    labelledInTime = firstLabelledAt <= window
+                } else {
+                    labelledInTime = false
+                }
+
+                if confirmed || labelledInTime {
+                    resolved += 1
+                } else if hasPending && now < window {
+                    continue // still in the Review window: undecided
+                } else {
+                    abandoned += 1
+                }
             }
-            let formatter = DateFormatter()
-            formatter.dateFormat = "yyyy-MM-dd"
-            formatter.timeZone = TimeZone(identifier: "UTC")
-            return byDay.compactMap { day, values in
-                guard let date = formatter.date(from: day) else { return nil }
-                let sorted = values.sorted()
-                return (day: date, medianMs: sorted[sorted.count / 2])
-            }
-            .sorted { $0.day < $1.day }
+            return (resolved: resolved, abandoned: abandoned)
         }
     }
 }
