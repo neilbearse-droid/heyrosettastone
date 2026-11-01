@@ -14,33 +14,31 @@ struct BoardView: View {
         case ask(onSelect: (IntentRecord) -> Void)
     }
 
+    /// A second tap on the same button inside this window is treated as
+    /// the same tap (a double tap must not speak twice or log twice).
+    static let sameIntentDebounce: TimeInterval = 0.25
+
     let intents: [IntentRecord]
     let mode: Mode
     let onTap: (IntentRecord) -> Void
 
-    private let speech = SpeechOutput()
-
-    /// Column count is fixed per size class, never adaptive, so a given
-    /// device always shows the same geometry. Touch targets stay >= 2.5 cm
-    /// (~160 pt) on iPhone with 2 columns.
-    @Environment(\.horizontalSizeClass) private var sizeClass
-
-    private var columns: [GridItem] {
-        let count = sizeClass == .regular ? 4 : 2
-        return Array(repeating: GridItem(.flexible(), spacing: 16), count: count)
-    }
+    @State private var lastTapIntentId: String?
+    @State private var lastTapAt = Date.distantPast
 
     var body: some View {
+        // Column count follows the device kind, never the size class:
+        // iPhone Plus/Max in landscape and iPad in Split View would
+        // otherwise reflow the grid and move every button (§2.3).
+        let isPad = UIDevice.current.userInterfaceIdiom == .pad
+        let columnCount = BoardLayout.columnCount(forPad: isPad)
+        let columns = Array(repeating: GridItem(.flexible(), spacing: 16), count: columnCount)
+
         ScrollView {
             LazyVGrid(columns: columns, spacing: 16) {
                 ForEach(Array(BoardLayout.cells(for: intents).enumerated()), id: \.offset) { _, cell in
                     if let intent = cell {
                         BoardButton(intent: intent) {
-                            speech.speak(intent.label)
-                            onTap(intent)
-                            if case .ask(let onSelect) = mode {
-                                onSelect(intent)
-                            }
+                            handleTap(intent)
                         }
                     } else {
                         // A removed button's slot stays visibly empty;
@@ -54,6 +52,33 @@ struct BoardView: View {
             .padding(16)
         }
         .background(Color(.systemBackground))
+        .onAppear {
+            // Resolve the voice before the first tap so the first word
+            // isn't late.
+            SpeechOutput.shared.prewarm()
+        }
+    }
+
+    private func handleTap(_ intent: IntentRecord) {
+        let now = Date()
+        if lastTapIntentId == intent.id,
+           now.timeIntervalSince(lastTapAt) < Self.sameIntentDebounce {
+            return
+        }
+        lastTapIntentId = intent.id
+        lastTapAt = now
+
+        // Speech first: the audible response is the feedback he is waiting
+        // for (§7). Event logging is a database write and goes after, off
+        // the main thread, so it can never delay the word.
+        SpeechOutput.shared.speak(intent.label)
+        let log = onTap
+        Task.detached(priority: .utility) {
+            log(intent)
+        }
+        if case .ask(let onSelect) = mode {
+            onSelect(intent)
+        }
     }
 }
 

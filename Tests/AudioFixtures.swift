@@ -22,8 +22,27 @@ enum AudioFixtures {
         [Float](repeating: 0, count: samples(seconds: seconds))
     }
 
-    /// Quiet background noise, seeded so tests are repeatable. Amplitude is
-    /// well below EnergyVAD's minimum RMS gate.
+    /// A tone that pulses on and off in whole 30 ms frames, frame-aligned
+    /// when ingested from a frame boundary. The off frames are short enough
+    /// that the hangover never elapses and the on frames are loud enough
+    /// that the adaptive noise floor never catches up, so the VAD treats
+    /// the whole thing as one continuous utterance. That is what a latched
+    /// detector looks like, and what `Tuning.maxUtterance` has to cut.
+    static func pulsedTone(seconds: TimeInterval, onFrames: Int = 4, offFrames: Int = 2,
+                           amplitude: Float = 0.5, frequency: Double = 330) -> [Float] {
+        let frame = SessionBuffer.frameLength
+        let count = samples(seconds: seconds)
+        let period = (onFrames + offFrames) * frame
+        return (0..<count).map { i in
+            let inPeriod = i % period
+            guard inPeriod < onFrames * frame else { return 0 }
+            return amplitude * Float(sin(2.0 * .pi * frequency * Double(i) / Double(sampleRate)))
+        }
+    }
+
+    /// Background noise, seeded so tests are repeatable. The default
+    /// amplitude is well below EnergyVAD's minimum RMS gate; pass a larger
+    /// one (0.02 is a TV in the next room) to exercise floor adaptation.
     static func roomNoise(seconds: TimeInterval, amplitude: Float = 0.002, seed: UInt64 = 42) -> [Float] {
         var state = seed
         let count = samples(seconds: seconds)

@@ -47,8 +47,17 @@ targets:
       properties:
         CFBundleDisplayName: Rosetta
         UILaunchScreen: {}
-        UISupportedInterfaceOrientations:
+        # iPhone is portrait-only: the child's grid must never reflow on a
+        # rotation (§2.3), and the counter stand holds the phone upright.
+        UISupportedInterfaceOrientations~iphone:
           - UIInterfaceOrientationPortrait
+        # iPad keeps rotating; its column count is fixed by device kind in
+        # BoardView, so rotation only changes cell width, not positions.
+        # All four orientations are listed because an iPad app that does not
+        # require full screen must support them all.
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
         NSMicrophoneUsageDescription: >-

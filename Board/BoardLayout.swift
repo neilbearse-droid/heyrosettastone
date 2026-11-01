@@ -22,6 +22,22 @@ enum BoardLayout {
         return slot
     }
 
+    /// Columns on the child's grid, fixed per device kind and never derived
+    /// from size class or orientation, so rotation and Split View cannot
+    /// reflow his buttons. iPhone: 2 columns (touch targets >= 2.5 cm, §7);
+    /// iPad: 4.
+    static func columnCount(forPad isPad: Bool) -> Int {
+        isPad ? 4 : 2
+    }
+
+    /// Where a row-major slot index lands for a fixed column count. A pure
+    /// function of (index, columns): nothing about other intents, the
+    /// device's orientation or window size enters into it (§2.3).
+    static func position(ofIndex index: Int, columns: Int) -> (row: Int, col: Int) {
+        let columns = max(1, columns)
+        return (index / columns, index % columns)
+    }
+
     /// Row-major cell list for rendering: every slot from 0 through the
     /// highest occupied, with nil for gaps, so removals never shift
     /// surviving buttons.

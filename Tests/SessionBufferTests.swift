@@ -27,8 +27,9 @@ final class SessionBufferTests: XCTestCase {
         let segment = recorder.segments[0]
         // Started near the 0.5 s mark (pre-roll reaches slightly earlier).
         XCTAssertEqual(segment.startTime, 0.5, accuracy: 0.2)
-        // Roughly the 1 s tone, plus pre-roll, minus nothing meaningful.
-        XCTAssertEqual(segment.duration, 1.0, accuracy: 0.3)
+        // The 1 s tone plus ~0.15 s pre-roll and ~0.15 s post-roll
+        // (Tuning.preRoll / Tuning.postRoll), so ~1.3 s.
+        XCTAssertEqual(segment.duration, 1.3, accuracy: 0.3)
         // The session closed ~10 s after speech ended.
         XCTAssertEqual(recorder.closes[0].time, 11.5, accuracy: 0.6)
     }
@@ -113,6 +114,95 @@ final class SessionBufferTests: XCTestCase {
         XCTAssertEqual(recorder.segments.count, 1)
         XCTAssertEqual(recorder.closes.count, 1)
         XCTAssertEqual(recorder.closes[0].reason, .interrupted)
+    }
+
+    func testSustainedNoiseUnlatchesAndNeverExceedsMaxUtterance() {
+        let recorder = BufferRecorder()
+        let buffer = makeBuffer(recorder: recorder)
+
+        // A TV comes on in the next room: steady noise just above the
+        // cold-start threshold (RMS ~0.0115 vs minimumRMS 0.01), for a long
+        // time. The old floor only adapted in silence, so this was "speech"
+        // forever and the session ran to the 90 s cap.
+        buffer.ingest(AudioFixtures.roomNoise(seconds: 15.0, amplitude: 0.02, seed: 11))
+
+        XCTAssertEqual(recorder.opens.count, 1, "the onset is still detected (over-detection is the chosen bias)")
+        // The floor absorbs the noise within a couple of seconds, so the
+        // session closes on silence ~10 s after that, well inside 15 s.
+        XCTAssertEqual(recorder.closes.count, 1, "the VAD must un-latch on sustained noise")
+        XCTAssertEqual(recorder.closes.first?.reason, .silence)
+        XCTAssertLessThan(recorder.closes.first?.time ?? .infinity, 13.0)
+        // Nothing but a short burst at the start was cut.
+        XCTAssertLessThanOrEqual(recorder.segments.count, 2)
+        for segment in recorder.segments {
+            XCTAssertLessThanOrEqual(segment.duration, buffer.tuning.maxUtterance + 0.1)
+        }
+    }
+
+    func testLatchedDetectorIsCutAtMaxUtterance() {
+        let recorder = BufferRecorder()
+        let buffer = makeBuffer(recorder: recorder)
+
+        // Loud frames interleaved with short gaps: the hangover never
+        // elapses and the floor never catches up, so without a cap this
+        // would be one 20 s utterance.
+        buffer.ingest(AudioFixtures.pulsedTone(seconds: 20.0))
+        buffer.ingest(AudioFixtures.silence(seconds: 11.0))
+
+        XCTAssertEqual(recorder.opens.count, 1)
+        XCTAssertEqual(recorder.closes.count, 1)
+        XCTAssertEqual(recorder.closes.first?.reason, .silence)
+        XCTAssertGreaterThanOrEqual(recorder.segments.count, 3, "20 s of speech is cut into 8 s pieces")
+        for segment in recorder.segments {
+            XCTAssertLessThanOrEqual(segment.duration, buffer.tuning.maxUtterance + 0.05,
+                                     "no segment may exceed Tuning.maxUtterance")
+        }
+        // The pieces are cut mid-speech, so the first ones are full length.
+        XCTAssertEqual(recorder.segments[0].duration, buffer.tuning.maxUtterance, accuracy: 0.05)
+    }
+
+    func testSubOnsetBlipDoesNotExtendSession() {
+        let recorder = BufferRecorder()
+        let buffer = makeBuffer(recorder: recorder)
+
+        buffer.ingest(AudioFixtures.tone(seconds: 1.0))      // 0–1    utterance
+        buffer.ingest(AudioFixtures.silence(seconds: 5.0))   // 1–6
+        buffer.ingest(AudioFixtures.tone(seconds: 0.03))     // 6–6.03 a dropped spoon: one frame
+        buffer.ingest(AudioFixtures.silence(seconds: 6.0))   // 6.03–12.03
+
+        XCTAssertEqual(recorder.opens.count, 1)
+        XCTAssertEqual(recorder.segments.count, 1, "the blip is below the onset debounce")
+        // Speech ended at ~1 s, so the 10 s silence close lands at ~11 s.
+        // If the blip had reset the silence timer the session would still
+        // be open at 12 s (close at ~16 s).
+        XCTAssertEqual(recorder.closes.count, 1, "a sub-onset blip must not keep the exchange open")
+        XCTAssertEqual(recorder.closes.first?.reason, .silence)
+        XCTAssertEqual(recorder.closes.first?.time ?? 0, 11.0, accuracy: 0.5)
+    }
+
+    func testPostRollPreservesQuietWordEnding() {
+        let recorder = BufferRecorder()
+        let buffer = makeBuffer(recorder: recorder)
+
+        // A loud vowel followed by a 100 ms low-energy consonant tail that
+        // the energy VAD classes as silence (RMS ~0.003, below the gate).
+        buffer.ingest(AudioFixtures.tone(seconds: 1.0))                        // 0–1
+        buffer.ingest(AudioFixtures.tone(seconds: 0.1, amplitude: 0.004))      // 1–1.1 the tail
+        buffer.ingest(AudioFixtures.silence(seconds: 11.0))
+
+        XCTAssertEqual(recorder.segments.count, 1)
+        let segment = recorder.segments[0]
+        let end = segment.startTime + segment.duration
+        // The segment must run past the end of the tail: trimming the full
+        // hangover used to cut it at ~1.02 s.
+        XCTAssertGreaterThanOrEqual(end, 1.1, "the quiet tail must survive the post-roll")
+        // And the tail audio is actually in the clip, not just its duration.
+        let tailStart = AudioFixtures.samples(seconds: 1.0 - segment.startTime)
+        let tailEnd = min(segment.samples.count, tailStart + AudioFixtures.samples(seconds: 0.1))
+        XCTAssertLessThan(tailStart, tailEnd)
+        let tailPeak = segment.samples[tailStart..<tailEnd].map(abs).max() ?? 0
+        XCTAssertGreaterThan(tailPeak, 0.001, "the tail samples should be present in the segment")
+        XCTAssertLessThan(tailPeak, 0.01, "and should be the quiet tail, not the vowel")
     }
 
     func testLabelAttachesToCorrectSegments() throws {
