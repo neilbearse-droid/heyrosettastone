@@ -15,7 +15,10 @@ final class ClipPlayer: NSObject, AVAudioPlayerDelegate {
             return
         }
         stop()
-        let url = FileLocations.clipURL(id: clipRef)
+        // A tombstoned ref (clip deleted) or a missing file simply does
+        // nothing; callers disable the control for those, this is the
+        // backstop.
+        guard let url = FileLocations.existingClipURL(id: clipRef) else { return }
         guard let player = try? AVAudioPlayer(contentsOf: url) else { return }
         player.delegate = self
         self.player = player

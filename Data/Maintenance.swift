@@ -74,19 +74,12 @@ enum Maintenance {
     }
 
     /// Removes `*.tmp` partial writes left by a kill mid-clip (A6). The
-    /// segment writer stages clips as `<id>.m4a.tmp` then renames; anything
-    /// still `.tmp` at launch is garbage. Returns the number removed.
+    /// segment writer stages clips as `<id>.m4a.tmp` then renames, and owns
+    /// the sweep; this just delegates so launch housekeeping has one entry
+    /// point. Returns the number removed.
     @discardableResult
     static func sweepTemporaryFiles(in directory: URL) -> Int {
-        let fm = FileManager.default
-        guard let files = try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else {
-            return 0
-        }
-        var removed = 0
-        for file in files where file.pathExtension.lowercased() == "tmp" {
-            if (try? fm.removeItem(at: file)) != nil { removed += 1 }
-        }
-        return removed
+        SegmentWriter.sweepTemporaryFiles(in: directory)
     }
 
     /// Deletes clip files no row references (segments, exemplars or

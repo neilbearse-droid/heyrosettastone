@@ -1,10 +1,16 @@
 import SwiftUI
+import UIKit
 
 /// Plain-language recording trust screen (§7, §8). Shown once, before
 /// anything records. Explains what is captured, where it lives, and how to
-/// delete it — in words, not policy.
+/// delete it — in words, not policy. Asks for the microphone here (A8) so
+/// the first Listen tap never races the system prompt.
+@MainActor
 struct FirstRunView: View {
     @Environment(AppEnvironment.self) private var env
+
+    @State private var requestingMicrophone = false
+    @State private var microphoneDenied = false
 
     var body: some View {
         ScrollView {
@@ -26,12 +32,12 @@ struct FirstRunView: View {
                 explainer(
                     icon: "iphone",
                     title: "Where it lives",
-                    body: "Everything stays on this device. Rosetta has no account, no cloud, and no way to send audio anywhere — the app is built without network access, and iOS enforces that."
+                    body: "Everything stays on this device. Rosetta never connects to the internet: there is no account, no cloud, and no code path that sends audio anywhere."
                 )
                 explainer(
                     icon: "trash",
                     title: "How to delete it",
-                    body: "Any clip can be deleted in one tap. Settings has a single button that erases everything, permanently."
+                    body: "Any clip can be removed in one tap from Review or Dictionary. Clips you discard, or mark as someone else's voice, are deleted — at the latest within 7 days. Settings has a single button that erases everything, permanently."
                 )
                 explainer(
                     icon: "hand.raised",
@@ -39,18 +45,60 @@ struct FirstRunView: View {
                     body: "The indicator is something he can learn to recognize. Pause is instant and always honoured. If he objects to a device in a room, that room goes quiet — no argument."
                 )
 
-                Button {
-                    env.hasCompletedFirstRun = true
-                } label: {
-                    Text("Got it — let's set up his words")
-                        .font(.headline)
+                if microphoneDenied {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Label("Microphone access is off", systemImage: "mic.slash")
+                            .font(.headline)
+                        Text("Without the microphone Rosetta cannot hear him, so Listen will not work. His board and dictionary still do. To turn listening on later: Settings > Privacy & Security > Microphone > Rosetta.")
+                            .foregroundStyle(.secondary)
+                        if let url = URL(string: UIApplication.openSettingsURLString) {
+                            Link("Open iPhone Settings", destination: url)
+                        }
+                        Button("Continue without listening for now") {
+                            env.hasCompletedFirstRun = true
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                    .padding(16)
+                    .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemBackground)))
+                } else {
+                    Button {
+                        requestMicrophone()
+                    } label: {
+                        HStack {
+                            if requestingMicrophone {
+                                ProgressView()
+                            }
+                            Text("Got it — let's set up his words")
+                                .font(.headline)
+                        }
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 6)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(requestingMicrophone)
+                    .padding(.top, 8)
+
+                    Text("Next, iOS will ask whether Rosetta may use the microphone. That is what makes listening possible.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
-                .buttonStyle(.borderedProminent)
-                .padding(.top, 8)
             }
             .padding(24)
+        }
+    }
+
+    private func requestMicrophone() {
+        guard !requestingMicrophone else { return }
+        requestingMicrophone = true
+        Task {
+            let granted = await CaptureController.requestMicrophonePermission()
+            requestingMicrophone = false
+            if granted {
+                env.hasCompletedFirstRun = true
+            } else {
+                microphoneDenied = true
+            }
         }
     }
 

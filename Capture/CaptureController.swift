@@ -55,12 +55,13 @@ final class CaptureController: SessionBufferDelegate {
     /// the Confirm card. Nil when no model is bundled — capture is
     /// deliberately ignorant of ML beyond this hook.
     @ObservationIgnored
-    var embedSamples: (([Float]) async -> Data?)?
+    var embedSamples: (([Float], _ segmentId: String) async -> Data?)?
 
     // MARK: Dependencies
 
     @ObservationIgnored private let engine = AudioCaptureEngine()
     @ObservationIgnored private let writer = SegmentWriter()
+    @ObservationIgnored private let db: AppDatabase
     @ObservationIgnored private let sessions: SessionStore
     @ObservationIgnored private let events: EventLog
 
@@ -78,8 +79,12 @@ final class CaptureController: SessionBufferDelegate {
     /// The noise floor is learned once per process; later starts and
     /// resumes carry the detector over instead of resetting it.
     @ObservationIgnored private var hasStartedOnce = false
+    /// The session most recently opened in this process, so the next open
+    /// can tell whether it displaced an exchange nobody resolved (§2.9).
+    @ObservationIgnored private var queueLastSessionId: String?
 
     init(db: AppDatabase) {
+        self.db = db
         self.sessions = SessionStore(db: db)
         self.events = EventLog(db: db)
         let station = UserDefaults.standard.string(forKey: "stationName") ?? "Home"
@@ -306,9 +311,25 @@ final class CaptureController: SessionBufferDelegate {
             failOnCaptureQueue("Could not save the new exchange, so listening stopped: \(error.localizedDescription)")
             return
         }
-        // TODO(wave2): log abandon event — if the previous session's
-        // segments are still pending when this one opens, log
-        // EventType.abandon for that exchange (§2.9 abandoned-exchange rate).
+        // Abandoned-exchange bookkeeping (§2.9): if the exchange this one
+        // displaces still has unlabelled segments, nobody got to the yes
+        // moment on the card. Log the marker (EventLog.exchangeOutcomes is
+        // the source of truth), then sweep Review expiry so the card and
+        // live guesses never operate on stale segments. Both are
+        // best-effort: a failed write here must not stop listening.
+        if let previous = queueLastSessionId, previous != id {
+            let previousSegments = (try? sessions.segments(sessionId: previous)) ?? []
+            if previousSegments.contains(where: { $0.segmentState == .pending }) {
+                try? events.log(EventRecord(
+                    exchangeId: previous,
+                    type: .abandon,
+                    device: queueStationName,
+                    timestamp: openedAt
+                ))
+            }
+        }
+        queueLastSessionId = id
+        _ = try? ReviewQueue(db: db).sweepExpired(now: openedAt)
         Task { @MainActor in
             self.activeSessionId = id
             self.activeSessionOpenedAt = openedAt
@@ -331,12 +352,15 @@ final class CaptureController: SessionBufferDelegate {
                 self.recentSegments.append(record)
             }
             if let embedSamples {
+                // The engine persists the blob on the segment row itself
+                // (SuggestionEngine.embedSamples(_:segmentId:)); only the
+                // in-memory chip needs patching here.
                 let samples = segment.samples
+                let segmentId = record.id
                 Task { [weak self] in
-                    guard let self, let blob = await embedSamples(samples) else { return }
-                    try? self.sessions.updateSegmentEmbedding(id: record.id, embedding: blob)
+                    guard let blob = await embedSamples(samples, segmentId), let self else { return }
                     await MainActor.run {
-                        if let i = self.recentSegments.firstIndex(where: { $0.id == record.id }) {
+                        if let i = self.recentSegments.firstIndex(where: { $0.id == segmentId }) {
                             self.recentSegments[i].embedding = blob
                         }
                     }

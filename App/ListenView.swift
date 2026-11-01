@@ -1,13 +1,19 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Ambient capture status and pause (§3), plus the way into his board and
-/// app settings. Pause is one tap and instant (§7).
+/// app settings. Pause is one tap and instant (§7). A live level meter with
+/// the speech threshold marked shows whether he registers at all (A4).
+@MainActor
 struct ListenView: View {
     @Environment(AppEnvironment.self) private var env
     let enterChildMode: () -> Void
 
     @State private var showingSettings = false
     @State private var liveGuesses: [Suggestion] = []
+    /// The one in-flight guess refresh; a newer refresh cancels it so stale
+    /// guesses never land after fresh ones (D9).
+    @State private var guessTask: Task<Void, Never>?
 
     var body: some View {
         NavigationStack {
@@ -19,6 +25,11 @@ struct ListenView: View {
 
                 if env.capture.isListening {
                     statusText
+                    LevelMeter(
+                        rms: env.capture.liveLevel.rms,
+                        threshold: env.capture.liveLevel.threshold
+                    )
+                    .padding(.horizontal, 48)
                     if !liveGuesses.isEmpty {
                         liveGuessStrip
                     }
@@ -78,6 +89,7 @@ struct ListenView: View {
                     } label: {
                         Image(systemName: "gearshape")
                     }
+                    .accessibilityLabel("Settings")
                 }
             }
             .sheet(isPresented: $showingSettings) { SettingsView() }
@@ -101,6 +113,7 @@ struct ListenView: View {
                                 .frame(width: 7, height: 7)
                         }
                     }
+                    .accessibilityLabel("Confidence \(guess.confidenceDots) of 3")
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
@@ -111,16 +124,20 @@ struct ListenView: View {
     }
 
     private func refreshLiveGuesses() {
+        guessTask?.cancel()
         let segments = env.capture.recentSegments.filter { $0.segmentState == .pending }
         guard !segments.isEmpty else {
             liveGuesses = []
             return
         }
-        Task {
-            liveGuesses = await env.suggestions.suggestions(
-                for: segments,
-                station: env.capture.stationName
-            )
+        let station = env.capture.stationName
+        let suggestions = env.suggestions
+        guessTask = Task {
+            // The engine unions in the exchange's own rejections, so a guess
+            // dismissed on the Confirm card stays out of this strip too (§2.4).
+            let guesses = await suggestions.suggestions(for: segments, station: station)
+            guard !Task.isCancelled else { return }
+            liveGuesses = guesses
         }
     }
 
@@ -144,8 +161,60 @@ struct ListenView: View {
     }
 }
 
+/// Microphone level against the speech threshold, so the family can see at
+/// a glance whether he registers from where he stands (A4). Both values
+/// are RMS; drawn on a dB scale so a soft voice is still visible.
+struct LevelMeter: View {
+    let rms: Float
+    let threshold: Float
+
+    /// Quietest level drawn (dBFS); anything below sits at the left edge.
+    private static let floorDB: Float = -70
+
+    private static func fraction(_ value: Float) -> CGFloat {
+        guard value > 0 else { return 0 }
+        let db = 20 * log10(value)
+        let clamped = min(max(db, floorDB), 0)
+        return CGFloat((clamped - floorDB) / -floorDB)
+    }
+
+    private var level: CGFloat { Self.fraction(rms) }
+    private var mark: CGFloat { Self.fraction(threshold) }
+    private var isAbove: Bool { threshold > 0 && rms >= threshold }
+
+    var body: some View {
+        VStack(spacing: 4) {
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color(.tertiarySystemFill))
+                    Capsule()
+                        .fill(isAbove ? Color.green : Color.accentColor.opacity(0.6))
+                        .frame(width: max(0, geo.size.width * level))
+                        .animation(.linear(duration: 0.1), value: level)
+                    if threshold > 0 {
+                        Rectangle()
+                            .fill(Color.primary.opacity(0.7))
+                            .frame(width: 2)
+                            .offset(x: geo.size.width * mark - 1)
+                    }
+                }
+            }
+            .frame(height: 10)
+            Text(threshold > 0
+                ? "Mic level — past the line counts as speech"
+                : "Mic level")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Microphone level")
+        .accessibilityValue(isAbove ? "Hearing speech" : "Quiet")
+    }
+}
+
 // MARK: - Settings
 
+@MainActor
 struct SettingsView: View {
     @Environment(AppEnvironment.self) private var env
     @Environment(\.dismiss) private var dismiss
@@ -153,9 +222,14 @@ struct SettingsView: View {
     @State private var labeller = ""
     @State private var station = ""
     @State private var includeAudioInBackup = UserDefaults.standard.bool(forKey: "includeAudioInBackup")
-    @State private var exportURL: URL?
-    @State private var exportError: String?
+    @State private var export = ExportController()
+    @State private var importer = ImportController()
+    @State private var showingImporter = false
+    @State private var storageLine: String?
+    @State private var slpSummary = ""
     @State private var confirmingWipe = false
+    @State private var isWiping = false
+    @State private var wipeError: String?
 
     var body: some View {
         NavigationStack {
@@ -185,26 +259,75 @@ struct SettingsView: View {
                     Text("Off means his voice recordings never leave this device, not even inside an iCloud or computer backup. Turn on only if you want recordings restored when moving phones.")
                 }
 
-                Section("His data") {
-                    Button {
-                        do { exportURL = try env.exporter.makeExportZip() }
-                        catch { exportError = error.localizedDescription }
-                    } label: {
-                        Label("Export everything (zip)", systemImage: "square.and.arrow.up")
+                Section {
+                    ShareLink(item: slpSummary) {
+                        Label("Share seed list for his SLP", systemImage: "square.and.arrow.up")
                     }
-                    if let exportURL {
-                        ShareLink(item: exportURL) {
-                            Label("Share export", systemImage: "doc.zipper")
+                    .disabled(slpSummary.isEmpty)
+                } header: {
+                    Text("His words")
+                } footer: {
+                    Text("A one-page text summary of his dictionary with how often each word has come up — no audio, no photos — for his speech-language pathologist.")
+                }
+
+                Section {
+                    if let storageLine {
+                        LabeledContent("On this phone", value: storageLine)
+                    }
+
+                    Button {
+                        export.run(env.exporter)
+                    } label: {
+                        if let progress = export.progress {
+                            HStack {
+                                ProgressView(value: progress)
+                                Text("Preparing…")
+                                    .foregroundStyle(.secondary)
+                            }
+                        } else {
+                            Label("Export everything (zip)", systemImage: "square.and.arrow.up")
                         }
                     }
-                    if let exportError {
-                        Text(exportError).font(.footnote).foregroundStyle(.red)
+                    .disabled(export.isRunning)
+                    if let error = export.error {
+                        Text(error).font(.footnote).foregroundStyle(.red)
                     }
+
+                    Button {
+                        showingImporter = true
+                    } label: {
+                        if importer.isRunning {
+                            HStack {
+                                ProgressView()
+                                Text("Restoring…")
+                                    .foregroundStyle(.secondary)
+                            }
+                        } else {
+                            Label("Restore from an export", systemImage: "square.and.arrow.down")
+                        }
+                    }
+                    .disabled(importer.isRunning)
+
                     Button(role: .destructive) {
                         confirmingWipe = true
                     } label: {
-                        Label("Delete everything", systemImage: "trash")
+                        if isWiping {
+                            HStack {
+                                ProgressView()
+                                Text("Deleting…")
+                            }
+                        } else {
+                            Label("Delete everything", systemImage: "trash")
+                        }
                     }
+                    .disabled(isWiping)
+                    if let wipeError {
+                        Text(wipeError).font(.footnote).foregroundStyle(.red)
+                    }
+                } header: {
+                    Text("His data")
+                } footer: {
+                    Text("Restoring adds what is missing from a Rosetta export and never overwrites anything already here. Tap the zip in Files to unzip it first, then choose the folder.")
                 }
             }
             .navigationTitle("Settings")
@@ -218,10 +341,33 @@ struct SettingsView: View {
                     }
                 }
             }
-            .alert("Delete everything?", isPresented: $confirmingWipe) {
-                Button("Delete all data", role: .destructive) {
-                    try? env.exporter.wipeAll()
+            .sheet(item: Bindable(export).result) { item in
+                ActivityShareSheet(item: item)
+            }
+            .fileImporter(
+                isPresented: $showingImporter,
+                allowedContentTypes: [.folder, .json]
+            ) { result in
+                switch result {
+                case .success(let url):
+                    importer.run(url: url, env: env) {
+                        refreshStorage()
+                        refreshSLPSummary()
+                    }
+                case .failure(let error):
+                    importer.message = error.localizedDescription
                 }
+            }
+            .alert("Restore", isPresented: Binding(
+                get: { importer.message != nil },
+                set: { if !$0 { importer.message = nil } }
+            )) {
+                Button("OK") { importer.message = nil }
+            } message: {
+                Text(importer.message ?? "")
+            }
+            .alert("Delete everything?", isPresented: $confirmingWipe) {
+                Button("Delete all data", role: .destructive) { wipeEverything() }
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text("Every word, clip, photo, and log on this device is erased permanently. There is no cloud copy and no undo.")
@@ -229,16 +375,78 @@ struct SettingsView: View {
             .onAppear {
                 labeller = env.labeller
                 station = env.capture.stationName
+                refreshStorage()
+                refreshSLPSummary()
             }
         }
+    }
+
+    /// Full local deletion (§8), then everything that still held the old
+    /// rows in memory is reset (B4): capture's chips and open session, the
+    /// backfill's missing-clip memory, the ranking index, and the setup
+    /// flag the views read.
+    private func wipeEverything() {
+        guard !isWiping else { return }
+        isWiping = true
+        wipeError = nil
+        env.capture.pauseListening()
+        env.capture.clearRecentSegments()
+        let exporter = env.exporter
+        Task {
+            let failure: String? = await Task.detached(priority: .userInitiated) {
+                do {
+                    try exporter.wipeAll()
+                    return nil
+                } catch {
+                    return error.localizedDescription
+                }
+            }.value
+            MissingClipRegistry.shared.removeAll()
+            PhotoCache.shared.removeAll()
+            await env.suggestions.reload()
+            isWiping = false
+            if let failure {
+                wipeError = failure
+                refreshStorage()
+            } else {
+                env.hasCompletedSetupInterview = false
+                dismiss()
+            }
+        }
+    }
+
+    /// "N clips, X MB" (B5), computed off the main thread: it walks the
+    /// clips directory.
+    private func refreshStorage() {
+        Task {
+            let summary = await Task.detached(priority: .utility) {
+                try? Maintenance.storageSummary()
+            }.value
+            guard let summary else {
+                storageLine = nil
+                return
+            }
+            let audio = ByteCountFormatter.string(fromByteCount: summary.bytes, countStyle: .file)
+            var line = "\(summary.clipCount) clip\(summary.clipCount == 1 ? "" : "s"), \(audio)"
+            if summary.photoBytes > 0 {
+                let photos = ByteCountFormatter.string(fromByteCount: summary.photoBytes, countStyle: .file)
+                line += " + \(photos) of photos"
+            }
+            storageLine = line
+        }
+    }
+
+    private func refreshSLPSummary() {
+        slpSummary = SeedListSummary.text(db: env.db, labeller: env.labeller)
     }
 }
 
 /// Voice selection with an audition — each candidate voice speaks a sample
-/// when selected, so he can pick by ear.
+/// when selected, so he can pick by ear. Uses the app's one long-lived
+/// synthesizer so the sample is not cut off when the row goes away (D7).
 struct VoicePickerRow: View {
+    @Environment(AppEnvironment.self) private var env
     @State private var selection = UserDefaults.standard.string(forKey: SpeechOutput.voiceDefaultsKey) ?? ""
-    private let speech = SpeechOutput()
 
     var body: some View {
         Picker("Voice", selection: $selection) {
@@ -248,8 +456,8 @@ struct VoicePickerRow: View {
             }
         }
         .onChange(of: selection) {
-            speech.voiceIdentifier = selection.isEmpty ? nil : selection
-            speech.speak("Hello!")
+            env.speech.voiceIdentifier = selection.isEmpty ? nil : selection
+            env.speech.speak("Hello!")
         }
     }
 }

@@ -3,7 +3,9 @@ import SwiftUI
 /// Evening batch labelling (§4.4). Each pending segment: play, then one tap
 /// to label, discard, or mark "not him". Segments expire out of the queue
 /// after 24 hours — kept on disk, flagged unlabelled — because memory of
-/// what he meant goes stale.
+/// what he meant goes stale. Discard and "not him" delete the recording
+/// (B3: the copy promised deletion, so it must happen).
+@MainActor
 struct ReviewView: View {
     @Environment(AppEnvironment.self) private var env
     @State private var pending: [SegmentRecord] = []
@@ -27,7 +29,7 @@ struct ReviewView: View {
                                 row(segment)
                             }
                         } footer: {
-                            Text("Clips leave this queue 24 hours after capture — label while you still remember the moment. Nothing is deleted; expired clips stay on the device.")
+                            Text("Clips leave this queue 24 hours after capture — label while you still remember the moment. Expired clips stay on the device, unlabelled. Discard and Not him delete the recording.")
                         }
                     }
                 }
@@ -57,14 +59,22 @@ struct ReviewView: View {
     private func row(_ segment: SegmentRecord) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Button {
-                    player.toggle(clipRef: segment.clipRef)
-                } label: {
-                    Image(systemName: player.playingClipRef == segment.clipRef
-                        ? "stop.circle.fill" : "play.circle.fill")
+                if segment.isClipDeleted {
+                    Image(systemName: "speaker.slash")
                         .font(.largeTitle)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("Recording deleted")
+                } else {
+                    Button {
+                        player.toggle(clipRef: segment.clipRef)
+                    } label: {
+                        Image(systemName: player.playingClipRef == segment.clipRef
+                            ? "stop.circle.fill" : "play.circle.fill")
+                            .font(.largeTitle)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(player.playingClipRef == segment.clipRef ? "Stop" : "Play clip")
                 }
-                .buttonStyle(.plain)
 
                 VStack(alignment: .leading) {
                     Text(segment.startedAt.formatted(date: .omitted, time: .shortened))
@@ -78,6 +88,7 @@ struct ReviewView: View {
             HStack(spacing: 10) {
                 Button("Label") { labelling = segment }
                     .buttonStyle(.borderedProminent)
+                    .disabled(segment.isClipDeleted)
                 Button("Not him") { resolve(segment, as: .notHim) }
                     .buttonStyle(.bordered)
                 Button("Discard", role: .destructive) { resolve(segment, as: .discarded) }
@@ -105,12 +116,25 @@ struct ReviewView: View {
             intentId: intent.id,
             device: env.capture.stationName
         ))
-        Task { await env.suggestions.reload() }
+        let suggestions = env.suggestions
+        Task { await suggestions.reload() }
         reload()
     }
 
+    /// Discard / not-him delete the audio as well as flipping the state;
+    /// the row stays as a tombstone so counts and history survive.
     private func resolve(_ segment: SegmentRecord, as state: SegmentState) {
-        try? env.sessions.updateSegmentState(id: segment.id, state: state)
+        if player.playingClipRef == segment.clipRef {
+            player.stop()
+        }
+        switch state {
+        case .notHim:
+            try? env.sessions.markNotHim(id: segment.id, deleteClip: true)
+        case .discarded:
+            try? env.sessions.discard(id: segment.id, deleteClip: true)
+        default:
+            try? env.sessions.updateSegmentState(id: segment.id, state: state)
+        }
         reload()
     }
 

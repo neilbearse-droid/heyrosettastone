@@ -2,22 +2,32 @@ import Charts
 import SwiftUI
 
 /// Progress (§3, §7 tone): celebrates the family's accumulated knowledge —
-/// words, confirmed clips, and time-to-understanding falling. Never a
-/// streak, never a score pointed at him. Per-word ML maturity joins in
-/// Phase 2 (§5.6).
+/// words, confirmed clips, exchanges that got there, and time-to-
+/// understanding falling. Never a streak, never a score pointed at him.
+/// Per-word ML maturity joins in Phase 2 (§5.6).
+@MainActor
 struct ProgressTabView: View {
     @Environment(AppEnvironment.self) private var env
 
-    struct WordRow {
+    struct WordRow: Identifiable {
+        /// The intent id — labels may legitimately repeat ("keep both" in
+        /// setup), so they cannot key the list (D9).
+        let id: String
         let label: String
         let count: Int
         let maturity: MaturityGate.Report?
     }
 
+    /// Window for the exchange-outcome card and the latency trend.
+    private static let window: TimeInterval = 30 * 24 * 3600
+
     @State private var totalExemplars = 0
     @State private var wordCount = 0
     @State private var perIntent: [WordRow] = []
     @State private var latencyTrend: [(day: Date, medianMs: Int)] = []
+    @State private var resolvedExchanges = 0
+    @State private var abandonedExchanges = 0
+    @State private var abandonedRate: Double?
 
     var body: some View {
         NavigationStack {
@@ -29,6 +39,24 @@ struct ProgressTabView: View {
                     }
                     .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
                     .listRowBackground(Color.clear)
+                }
+
+                // §2.9's second metric, framed as what the family achieved
+                // (D3). Sessions still inside their Review window are
+                // neither resolved nor abandoned and are left out.
+                if resolvedExchanges + abandonedExchanges > 0 {
+                    Section {
+                        statCard(
+                            value: "\(resolvedExchanges) of \(resolvedExchanges + abandonedExchanges)",
+                            caption: "exchanges that got there in the last 30 days"
+                        )
+                        .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
+                        .listRowBackground(Color.clear)
+                    } footer: {
+                        if let abandonedRate {
+                            Text("Got there means confirmed on the card or labelled in Review within a day. \(Int((abandonedRate * 100).rounded()))% went unresolved — those are the ones to catch sooner next time.")
+                        }
+                    }
                 }
 
                 if !latencyTrend.isEmpty {
@@ -45,6 +73,7 @@ struct ProgressTabView: View {
                         }
                         .frame(height: 180)
                         .padding(.vertical, 8)
+                        .accessibilityLabel("Median seconds to understanding per day")
                     } header: {
                         Text("Time to understanding")
                     } footer: {
@@ -53,7 +82,7 @@ struct ProgressTabView: View {
                 }
 
                 Section {
-                    ForEach(perIntent, id: \.label) { row in
+                    ForEach(perIntent) { row in
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(row.label)
@@ -72,7 +101,7 @@ struct ProgressTabView: View {
                     Text("What the model knows, word by word")
                 } footer: {
                     Text(env.suggestions.isModelAvailable
-                        ? "A word starts getting guessed once it has 5 confirmed clips and the model recognizes its own examples reliably. More confirmations always help."
+                        ? "A word starts getting guessed once it has 5 confirmed clips from 3 different exchanges and the model recognizes its own examples reliably. More confirmations always help."
                         : "Guessing is off — no recognition model is bundled in this build. Every confirmation still counts; guesses appear the moment a model is added.")
                 }
             }
@@ -83,7 +112,12 @@ struct ProgressTabView: View {
 
     private func statCard(value: String, caption: String) -> some View {
         VStack(spacing: 4) {
-            Text(value).font(.system(size: 40, weight: .bold, design: .rounded))
+            // Dynamic Type-relative (D9), rounded for the celebratory tone.
+            Text(value)
+                .font(.system(.largeTitle, design: .rounded).weight(.bold))
+                .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
             Text(caption)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -104,10 +138,11 @@ struct ProgressTabView: View {
             let pct = Int(((report.looTop3HitRate ?? 0) * 100).rounded())
             return "guessing live — recognizes \(pct)% of its own clips"
         }
-        if report.exemplarCount < MaturityGate.Config().minExemplars {
-            return "learning — \(report.exemplarCount) of \(MaturityGate.Config().minExemplars) clips needed"
+        let minimum = MaturityGate.Config().minExemplars
+        if report.exemplarCount < minimum {
+            return "learning — \(report.exemplarCount) of \(minimum) clips needed"
         }
-        return "needs more varied clips before guessing"
+        return "needs clips from more separate exchanges before guessing"
     }
 
     @ViewBuilder
@@ -123,19 +158,30 @@ struct ProgressTabView: View {
         let intents = (try? env.intents.all()) ?? []
         wordCount = intents.count
         totalExemplars = (try? env.exemplars.totalCount()) ?? 0
-        let reports = Dictionary(
-            uniqueKeysWithValues: env.suggestions.maturityReports.map { ($0.intentId, $0) }
-        )
+        var reports: [String: MaturityGate.Report] = [:]
+        for report in env.suggestions.maturityReports {
+            reports[report.intentId] = report
+        }
         perIntent = intents
             .map { intent in
                 WordRow(
+                    id: intent.id,
                     label: intent.label,
                     count: (try? env.exemplars.count(intentId: intent.id)) ?? 0,
                     maturity: reports[intent.id]
                 )
             }
             .sorted { $0.count > $1.count }
-        let monthAgo = Date().addingTimeInterval(-30 * 24 * 3600)
-        latencyTrend = (try? env.events.confirmLatencies(since: monthAgo)) ?? []
+
+        let since = Date().addingTimeInterval(-Self.window)
+        latencyTrend = (try? env.events.confirmLatencies(since: since)) ?? []
+        if let outcomes = try? env.events.exchangeOutcomes(since: since) {
+            resolvedExchanges = outcomes.resolved
+            abandonedExchanges = outcomes.abandoned
+        } else {
+            resolvedExchanges = 0
+            abandonedExchanges = 0
+        }
+        abandonedRate = try? env.events.abandonedRate(since: since)
     }
 }

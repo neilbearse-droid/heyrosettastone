@@ -2,20 +2,20 @@ import SwiftUI
 
 /// Top-level navigation: first-run consent → setup interview → the app.
 /// The app itself is either the child's board (full screen, guarded exit)
-/// or the parent tabs.
+/// or the parent tabs. Which of the two is persisted (`childMode`), so a
+/// relaunch of the counter phone lands where it was.
 struct RootView: View {
     @Environment(AppEnvironment.self) private var env
-    @State private var childMode = false
 
     var body: some View {
         if !env.hasCompletedFirstRun {
             FirstRunView()
         } else if !env.hasCompletedSetupInterview {
             SetupInterviewView()
-        } else if childMode {
-            ChildBoardScreen(exit: { childMode = false })
+        } else if env.childMode {
+            ChildBoardScreen(exit: { env.childMode = false })
         } else {
-            ParentTabView(enterChildMode: { childMode = true })
+            ParentTabView(enterChildMode: { env.childMode = true })
         }
     }
 }
@@ -32,12 +32,24 @@ struct ChildBoardScreen: View {
     var body: some View {
         ZStack(alignment: .topTrailing) {
             BoardView(intents: intents, mode: .child) { intent in
-                try? env.events.log(EventRecord(
-                    exchangeId: env.capture.activeSessionId,
-                    type: .boardTap,
-                    intentId: intent.id,
-                    device: env.capture.stationName
-                ))
+                // BoardView calls this off the main thread so the word is
+                // never delayed by the write; observable capture state is
+                // read on the main actor, then the row is written off it.
+                // The tap is attached to the open exchange, or the one that
+                // just closed — he usually walks over after he has spoken —
+                // so the Confirm card can pin "He tapped: banana" (§4.3).
+                Task { @MainActor in
+                    let event = EventRecord(
+                        exchangeId: env.currentOrRecentExchangeId,
+                        type: .boardTap,
+                        intentId: intent.id,
+                        device: env.capture.stationName
+                    )
+                    let events = env.events
+                    Task.detached(priority: .utility) {
+                        try? events.log(event)
+                    }
+                }
             }
 
             HoldToExitButton(action: exit)
@@ -108,12 +120,20 @@ struct ParentTabView: View {
     @Environment(AppEnvironment.self) private var env
     let enterChildMode: () -> Void
 
+    /// Chips waiting on the Confirm card: the cheap interim stand-in for
+    /// the lock-screen Live Activity (§7) — a glance at the tab bar says an
+    /// exchange is waiting.
+    private var pendingCount: Int {
+        env.capture.recentSegments.filter { $0.segmentState == .pending }.count
+    }
+
     var body: some View {
         TabView {
             ListenView(enterChildMode: enterChildMode)
                 .tabItem { Label("Listen", systemImage: "waveform") }
             ConfirmCardView()
                 .tabItem { Label("Confirm", systemImage: "checkmark.bubble") }
+                .badge(pendingCount)
             ReviewView()
                 .tabItem { Label("Review", systemImage: "tray.full") }
             DictionaryView()

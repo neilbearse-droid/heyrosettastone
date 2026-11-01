@@ -122,20 +122,24 @@ struct BoardButton: View {
 
     @ViewBuilder
     private var photo: some View {
-        if let ref = intent.photoRef,
-           let image = UIImage(contentsOfFile: FileLocations.photoURL(id: ref).path) {
-            Image(uiImage: image)
-                .resizable()
-                .scaledToFill()
+        if let ref = intent.photoRef {
+            // Decoded once, off the main thread, and cached (PhotoCache):
+            // a cell render must never decode a JPEG on the thread that
+            // delivers his press feedback (§7).
+            CachedPhoto(ref: ref) { letterTile }
         } else {
-            RoundedRectangle(cornerRadius: 12)
-                .fill(Color(.tertiarySystemFill))
-                .overlay(
-                    Text(String(intent.label.prefix(1)).uppercased())
-                        .font(.system(size: 56, weight: .bold))
-                        .foregroundStyle(.secondary)
-                )
+            letterTile
         }
+    }
+
+    private var letterTile: some View {
+        RoundedRectangle(cornerRadius: 12)
+            .fill(Color(.tertiarySystemFill))
+            .overlay(
+                Text(String(intent.label.prefix(1)).uppercased())
+                    .font(.system(size: 56, weight: .bold))
+                    .foregroundStyle(.secondary)
+            )
     }
 }
 

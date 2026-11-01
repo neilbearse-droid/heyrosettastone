@@ -29,6 +29,7 @@ struct DictionaryView: View {
                                 Image(systemName: "square.grid.2x2")
                                     .font(.caption)
                                     .foregroundStyle(.tint)
+                                    .accessibilityLabel("On his board")
                             }
                         }
                     }
@@ -41,6 +42,7 @@ struct DictionaryView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { addingNew = true } label: { Image(systemName: "plus") }
+                        .accessibilityLabel("Add a word")
                 }
             }
             .sheet(isPresented: $addingNew) {
@@ -62,6 +64,7 @@ struct DictionaryView: View {
 
 // MARK: - Detail
 
+@MainActor
 struct IntentDetailView: View {
     @Environment(AppEnvironment.self) private var env
     @Environment(\.dismiss) private var dismiss
@@ -78,12 +81,10 @@ struct IntentDetailView: View {
         List {
             if let intent {
                 Section {
-                    if let ref = intent.photoRef,
-                       let image = UIImage(contentsOfFile: FileLocations.photoURL(id: ref).path) {
-                        Image(uiImage: image)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(maxHeight: 180)
+                    if let ref = intent.photoRef {
+                        CachedPhoto(ref: ref)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 180)
                             .clipShape(RoundedRectangle(cornerRadius: 12))
                             .listRowInsets(EdgeInsets())
                     }
@@ -109,36 +110,33 @@ struct IntentDetailView: View {
                     Text("New buttons take the first empty spot. Existing buttons never move — his hands know where they are.")
                 }
 
-                Section("Confirmed clips (\(exemplars.count))") {
+                Section {
                     if exemplars.isEmpty {
                         Text("None yet. Clips arrive when you confirm exchanges.")
                             .foregroundStyle(.secondary)
                     }
                     ForEach(exemplars) { exemplar in
-                        HStack {
-                            Button {
-                                player.toggle(clipRef: exemplar.clipRef)
-                            } label: {
-                                Image(systemName: player.playingClipRef == exemplar.clipRef
-                                    ? "stop.circle.fill" : "play.circle.fill")
-                                    .font(.title2)
-                            }
-                            .buttonStyle(.plain)
-                            VStack(alignment: .leading) {
-                                Text(exemplar.timestamp.formatted(date: .abbreviated, time: .shortened))
-                                Text("\(exemplar.labeller) · \(exemplar.device)")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
+                        exemplarRow(exemplar)
                     }
                     .onDelete { offsets in
-                        for index in offsets {
-                            try? env.exemplars.delete(id: exemplars[index].id)
+                        // Pruning deletes the audio too (B3); the segment row
+                        // stays as a tombstone.
+                        for index in offsets where index < exemplars.count {
+                            let exemplar = exemplars[index]
+                            if player.playingClipRef == exemplar.clipRef {
+                                player.stop()
+                            }
+                            try? env.exemplars.delete(id: exemplar.id, deleteClip: true)
                         }
-                        Task { await env.suggestions.reload() }
+                        let suggestions = env.suggestions
+                        Task { await suggestions.reload() }
                         refresh()
+                        onChange()
                     }
+                } header: {
+                    Text("Confirmed clips (\(exemplars.count))")
+                } footer: {
+                    Text("Swipe a clip to delete it and its recording — one mislabelled clip should not teach the wrong word.")
                 }
 
                 Section {
@@ -163,16 +161,41 @@ struct IntentDetailView: View {
         }
         .alert("Delete “\(intent?.label ?? "")”?", isPresented: $confirmingDelete) {
             Button("Delete forever", role: .destructive) {
+                player.stop()
                 try? env.intents.deleteForever(id: intentId)
-                Task { await env.suggestions.reload() }
+                let suggestions = env.suggestions
+                Task { await suggestions.reload() }
                 onChange()
                 dismiss()
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Removes the word, its board button, and every confirmed clip of it. This cannot be undone.")
+            Text("Removes the word, its board button, and every confirmed clip of it, recordings included. This cannot be undone.")
         }
         .onAppear(perform: refresh)
+    }
+
+    private func exemplarRow(_ exemplar: ExemplarRecord) -> some View {
+        let deleted = FileLocations.isDeleted(clipRef: exemplar.clipRef)
+        return HStack {
+            Button {
+                player.toggle(clipRef: exemplar.clipRef)
+            } label: {
+                Image(systemName: deleted
+                    ? "speaker.slash"
+                    : (player.playingClipRef == exemplar.clipRef ? "stop.circle.fill" : "play.circle.fill"))
+                    .font(.title2)
+            }
+            .buttonStyle(.plain)
+            .disabled(deleted)
+            .accessibilityLabel(deleted ? "Recording deleted" : (player.playingClipRef == exemplar.clipRef ? "Stop" : "Play clip"))
+            VStack(alignment: .leading) {
+                Text(exemplar.capturedAt.formatted(date: .abbreviated, time: .shortened))
+                Text("\(exemplar.labeller) · \(exemplar.device)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
     }
 
     private func refresh() {
@@ -206,12 +229,9 @@ struct IntentEditorSheet: View {
                               text: $respondNote, axis: .vertical)
                 }
                 Section("Photo") {
-                    if let photoRef,
-                       let image = UIImage(contentsOfFile: FileLocations.photoURL(id: photoRef).path) {
+                    if let photoRef {
                         HStack {
-                            Image(uiImage: image)
-                                .resizable()
-                                .scaledToFill()
+                            CachedPhoto(ref: photoRef)
                                 .frame(width: 64, height: 64)
                                 .clipShape(RoundedRectangle(cornerRadius: 8))
                             Button("Remove", role: .destructive) { self.photoRef = nil }
@@ -249,7 +269,9 @@ struct IntentEditorSheet: View {
             }
             .sheet(item: $photoSource) { source in
                 PhotoCapture(source: source) { ref in
-                    photoRef = ref
+                    if let ref {
+                        photoRef = ref
+                    }
                     photoSource = nil
                 }
             }
