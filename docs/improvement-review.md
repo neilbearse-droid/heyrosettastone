@@ -717,6 +717,26 @@ Deliberately not done: the lock-screen Live Activity for Confirm
 (the energy VAD was fixed instead; Silero remains the real fix for TV
 and sibling voices and `docs/silero-vad-conversion.md` is the plan).
 
+### Added after the first on-device run: the self-similarity floor
+
+The family's first test showed the one-word failure: with only "football"
+taught, "Chase" was suggested as "Maybe: Football?". Relative ranking
+(standardized score, calibration, top-3) always has a leader; with one word
+the leader is that word. Fix: the maturity pass now records, for every
+clip of a word, its best raw cosine to the word's clips from other
+exchanges. The 10th percentile of those minus 0.02 is the word's
+`selfSimilarityFloor` (on `MaturityGate.Report`). An utterance whose best
+raw match to a word is under that floor is never suggested as that word,
+whatever else is in the store. `SuggestionEngine.usesSimilarityFloor`
+turns it off for diagnosis. Covered by
+`SuggestionEngineTests.testOneMatureWordIsNotSuggestedForAnUnrelatedUtterance`,
+which also demonstrates the unguarded behaviour.
+
+Tuning to watch on device: if real within-word spread is wide (apraxic
+variability), the 0.02 tolerance may reject true matches; raise
+`MaturityGate.Config.selfSimilarityTolerance` or lower the quantile. Log
+`Suggestion.bestSimilarity` against each word's floor for a few exchanges.
+
 ### Nothing here has been compiled
 
 No Xcode was available where this work was done. Every file was read

@@ -79,6 +79,21 @@ enum IntentRanker {
         /// How many of the intent's exemplars (≤ k) had a positive
         /// weighted similarity.
         let neighbourCount: Int
+        /// Best raw cosine (no recency weight, no bonus) between the query
+        /// and any of the intent's exemplars. This is the absolute evidence
+        /// the engine checks against the word's own self-similarity floor
+        /// (`MaturityGate.Report.selfSimilarityFloor`): `z` says how the
+        /// word compares with the other words, `bestSimilarity` says
+        /// whether the utterance resembles this word at all.
+        let bestSimilarity: Double
+
+        init(intentId: String, score: Double, z: Double, neighbourCount: Int, bestSimilarity: Double = 0) {
+            self.intentId = intentId
+            self.score = score
+            self.z = z
+            self.neighbourCount = neighbourCount
+            self.bestSimilarity = bestSimilarity
+        }
     }
 
     /// Full ranking result including the standardization statistics, so a
@@ -137,7 +152,7 @@ enum IntentRanker {
         let eligible = exemplars.filter { !excluding.contains($0.intentId) && $0.vector.count == query.count }
         guard !eligible.isEmpty else { return empty }
 
-        let scored: [(intentId: String, weightedSim: Double)] = eligible.map { exemplar in
+        let scored: [(intentId: String, weightedSim: Double, rawSim: Double)] = eligible.map { exemplar in
             let similarity = VectorMath.cosine(query, exemplar.vector)
             let weight = recencyWeight(
                 timestamp: exemplar.timestamp,
@@ -149,7 +164,7 @@ enum IntentRanker {
             // Similarity can be negative; clamp so a strongly-dissimilar old
             // exemplar can't outrank a mildly-dissimilar fresh one after
             // weighting flips the sign ordering.
-            return (exemplar.intentId, max(0, similarity) * weight)
+            return (exemplar.intentId, max(0, similarity) * weight, similarity)
         }
 
         let stats = standardization(of: scored.map(\.weightedSim))
@@ -172,13 +187,15 @@ enum IntentRanker {
     /// reference path: neighbours with a non-positive weighted similarity
     /// are dropped before the k cut, then each intent is scored on its own
     /// k nearest.
-    static func scoreIntents(_ scored: [(intentId: String, weightedSim: Double)],
+    static func scoreIntents(_ scored: [(intentId: String, weightedSim: Double, rawSim: Double)],
                              mean: Double,
                              std: Double,
                              config: Config) -> [RankedIntent] {
         var byIntent: [String: [Double]] = [:]
+        var bestRaw: [String: Double] = [:]
         for entry in scored where entry.weightedSim > 0 {
             byIntent[entry.intentId, default: []].append(entry.weightedSim)
+            bestRaw[entry.intentId] = max(bestRaw[entry.intentId] ?? -1, entry.rawSim)
         }
         let sd = max(std, config.minStd)
         let margin = config.agreementStdMargin * sd
@@ -190,7 +207,13 @@ enum IntentRanker {
                 let agreeing = topK.dropFirst().filter { $0 >= best - margin }.count
                 let z = (best - mean) / sd + config.agreementBonus * Double(agreeing)
                 let score = min(1.0, best * (1 + config.legacyScoreBonus * Double(agreeing)))
-                return RankedIntent(intentId: intentId, score: score, z: z, neighbourCount: topK.count)
+                return RankedIntent(
+                    intentId: intentId,
+                    score: score,
+                    z: z,
+                    neighbourCount: topK.count,
+                    bestSimilarity: bestRaw[intentId] ?? 0
+                )
             }
             .sorted { lhs, rhs in
                 if lhs.z != rhs.z { return lhs.z > rhs.z }

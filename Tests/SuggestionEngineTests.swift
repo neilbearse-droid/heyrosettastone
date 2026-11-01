@@ -72,10 +72,22 @@ final class SuggestionEngineTests: XCTestCase {
     /// The day after the seed data, mid-morning: recency boosts are gone.
     private var queryNow: Date { localDate(day: 3, hour: 9) }
 
+    /// Six ways of saying one word: mostly along `axis`, each leaning a
+    /// different way by 0.6, so clips of the same word match each other at
+    /// cosine 1/(1+0.36) ≈ 0.735 across exchanges (a realistic spread; a
+    /// tighter cluster would make every mixed query fail the word's
+    /// self-similarity floor, which is the guard working as intended).
     private func cluster(axis: Int, count: Int = 6) -> [[Float]] {
         (0..<count).map { i in
-            EmbeddingFixtures.near(axis, leaning: (axis + i + 1) % EmbeddingFixtures.dim, by: 0.08)
+            EmbeddingFixtures.near(axis, leaning: (axis + i + 1) % EmbeddingFixtures.dim, by: 0.6)
         }
+    }
+
+    /// Cross-session self-similarity of a `cluster` word minus the
+    /// tolerance: what the engine requires of an utterance before it will
+    /// name that word.
+    private var clusterFloor: Double {
+        1.0 / 1.36 - MaturityGate.Config().selfSimilarityTolerance
     }
 
     /// "help" sits on axis 3 with a faint lean toward axis 0: a small but
@@ -85,9 +97,10 @@ final class SuggestionEngineTests: XCTestCase {
         Array(repeating: EmbeddingFixtures.near(3, leaning: 0, by: 0.05), count: 6)
     }
 
-    /// Leans on banana, water and outside in that order; orthogonal to help
-    /// except for help's own faint lean.
-    private var mixedQuery: [Float] { EmbeddingFixtures.mix([1, 0.9, 0.8]) }
+    /// Leans on banana, water and outside in that order (best raw cosine
+    /// ≈ 0.857, 0.765, 0.737 against their clusters, all above the 0.715
+    /// floor); orthogonal to help except for help's own faint lean.
+    private var mixedQuery: [Float] { EmbeddingFixtures.mix([1, 0.95, 0.75]) }
 
     /// Inserts one exchange session with a segment per vector (embedding
     /// stored on the row) and confirms them all as `intent` at `confirmedAt`.
@@ -167,15 +180,63 @@ final class SuggestionEngineTests: XCTestCase {
 
         let guesses = await engine.suggestions(for: [querySegment()], station: station, now: queryNow)
         XCTAssertEqual(guesses.map(\.intent.id), [banana.id, water.id, outside.id],
-                       "top-3 is three when three mature words fit; help is mature but falls under the floor")
+                       "top-3 is three when three mature words fit; help is mature but the utterance does not resemble it")
         for guess in guesses {
             XCTAssertGreaterThanOrEqual(guess.probability, 0.15)
+            XCTAssertGreaterThanOrEqual(guess.bestSimilarity, clusterFloor,
+                                        "every shown word cleared its own self-similarity floor")
             XCTAssertEqual(guess.prior, 1.0, accuracy: 0.01, "uniform history → neutral prior")
             XCTAssertGreaterThan(guess.z, -0.5)
         }
         XCTAssertGreaterThan(guesses[0].z, guesses[1].z)
         XCTAssertGreaterThan(guesses[1].z, guesses[2].z)
         XCTAssertEqual(embedder.calls, 0, "segments carried embeddings; nothing was encoded")
+    }
+
+    /// The first-moment failure: the family has taught exactly one word
+    /// ("football"), he says something unrelated ("Chase"), and the app
+    /// must say nothing — not "Maybe: football?". Relative ranking alone
+    /// cannot do this (with one word in the store the leader is always
+    /// that word); the self-similarity floor can.
+    func testOneMatureWordIsNotSuggestedForAnUnrelatedUtterance() async throws {
+        try seed(intent: banana, vectors: cluster(axis: 0), capturedHour: 9)
+        await engine.reload()
+        let suggestible = await engine.suggestibleIntentIds
+        XCTAssertEqual(suggestible, [banana.id])
+
+        // Nothing like banana: on axis 5, with a faint lean elsewhere. Its
+        // best raw match to banana is ≈ 0.50 (one banana clip leans toward
+        // axis 5), well under banana's floor of ≈ 0.715.
+        let unrelated = EmbeddingFixtures.near(5, leaning: 6, by: 0.2)
+        let guesses = await engine.suggestions(
+            for: [querySegment(id: "chase", vector: unrelated)], station: station, now: queryNow
+        )
+        XCTAssertTrue(guesses.isEmpty, "a one-word dictionary must be able to answer \"nothing\"")
+
+        // Proof that this is the floor's doing and not an accident of the
+        // fixture: without it, the same utterance is confidently banana.
+        await MainActor.run { engine.usesSimilarityFloor = false }
+        let unguarded = await engine.suggestions(
+            for: [querySegment(id: "chase2", vector: unrelated)], station: station, now: queryNow
+        )
+        XCTAssertEqual(unguarded.map(\.intent.id), [banana.id],
+                       "relative ranking always has a leader — this is the bug the floor fixes")
+        XCTAssertGreaterThanOrEqual(unguarded[0].probability, 0.5, "and it would even have shown two dots")
+        await MainActor.run { engine.usesSimilarityFloor = true }
+
+        // A genuine banana still gets through.
+        let bananaLike = EmbeddingFixtures.near(0, leaning: 7, by: 0.1)
+        let real = await engine.suggestions(
+            for: [querySegment(id: "b", vector: bananaLike)], station: station, now: queryNow
+        )
+        XCTAssertEqual(real.map(\.intent.id), [banana.id])
+        XCTAssertGreaterThanOrEqual(real[0].bestSimilarity, clusterFloor)
+
+        // The word's report carries the floor Progress can explain.
+        let reports = await engine.maturityReports
+        let bananaReport = try XCTUnwrap(reports.first { $0.intentId == banana.id })
+        XCTAssertEqual(bananaReport.selfSimilarityFloor ?? .nan, clusterFloor, accuracy: 1e-4)
+        XCTAssertEqual(bananaReport.typicalSelfSimilarity ?? .nan, 1.0 / 1.36, accuracy: 1e-4)
     }
 
     func testRejectionsInTheNegativesTableAreHonouredWhicheverSurfaceAsks() async throws {

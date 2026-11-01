@@ -20,6 +20,9 @@ struct Suggestion: Identifiable, Equatable {
     let rankingScore: Double
     /// Number of the exchange's segments in whose top-3 this intent appeared.
     let votes: Int
+    /// Mean over the exchange's segments of the best raw cosine to this
+    /// word's exemplars; it cleared the word's self-similarity floor.
+    var bestSimilarity: Double = 0
 
     var id: String { intent.id }
     var z: Double { rawScore }
@@ -51,6 +54,10 @@ final class SuggestionEngine {
     @ObservationIgnored private var calibrators: [String: LogisticCalibrator] = [:]
     @ObservationIgnored private var priors: ContextPriors?
     @ObservationIgnored private var suggestibleIntents: Set<String> = []
+    /// Per word: the minimum raw cosine an utterance must reach against
+    /// that word's exemplars to be suggested as it (from the maturity
+    /// pass). Absolute evidence, independent of what else is in the store.
+    @ObservationIgnored private var similarityFloors: [String: Double] = [:]
     @ObservationIgnored private var maturityCache = MaturityGate.Cache()
     @ObservationIgnored private var isEmbeddingMissingExemplars = false
 
@@ -64,6 +71,9 @@ final class SuggestionEngine {
     @ObservationIgnored private var rejectedExchangeOrder: [String] = []
     @ObservationIgnored private let rejectedCacheLimit = 32
 
+    /// Apply each word's self-similarity floor (`MaturityGate.Report
+    /// .selfSimilarityFloor`) before anything else. Tunable for diagnosis.
+    @ObservationIgnored var usesSimilarityFloor = true
     /// Skip guesses whose calibrated acoustic probability is below this.
     /// On the uncalibrated default (slope 1, intercept −1.5) this filters
     /// intents whose best match sits more than ~0.23 std below the mean
@@ -146,6 +156,11 @@ final class SuggestionEngine {
         self.maturityCache = built.maturityCache
         self.maturityReports = built.reports
         self.suggestibleIntents = Set(built.reports.filter(\.isSuggestible).map(\.intentId))
+        var floors: [String: Double] = [:]
+        for report in built.reports {
+            if let floor = report.selfSimilarityFloor { floors[report.intentId] = floor }
+        }
+        self.similarityFloors = floors
 
         if embedMissing, embedder != nil, !built.exemplarsMissingEmbedding.isEmpty {
             embedMissingExemplars(built.exemplarsMissingEmbedding)
@@ -481,18 +496,24 @@ final class SuggestionEngine {
         }
 
         // Mean of per-segment z; where an intent had no positive match for
-        // a segment it contributes the z of a zero similarity there.
+        // a segment it contributes the z of a zero similarity there. The
+        // best raw similarity is averaged the same way (absent → 0) for the
+        // absolute guard below.
         var meanZ: [String: Double] = [:]
+        var meanBestSimilarity: [String: Double] = [:]
         for intentId in seen {
             var total = 0.0
+            var similarityTotal = 0.0
             for ranking in rankings {
                 if let ranked = ranking.intents.first(where: { $0.intentId == intentId }) {
                     total += ranked.z
+                    similarityTotal += max(0, ranked.bestSimilarity)
                 } else {
                     total += ranking.z(forWeightedSimilarity: 0, config: config)
                 }
             }
             meanZ[intentId] = total / Double(rankings.count)
+            meanBestSimilarity[intentId] = similarityTotal / Double(rankings.count)
         }
 
         let context = ContextPriors.Snapshot(
@@ -506,6 +527,8 @@ final class SuggestionEngine {
         }) ?? []
         let intentById = Dictionary(uniqueKeysWithValues: activeIntents.map { ($0.id, $0) })
         let floor = probabilityFloor
+        let similarityFloors = self.similarityFloors
+        let usesSimilarityFloor = self.usesSimilarityFloor
 
         return meanZ
             .filter { suggestibleIntents.contains($0.key) && !excluded.contains($0.key) }
@@ -513,6 +536,14 @@ final class SuggestionEngine {
                 let intentId = entry.key
                 let z = entry.value
                 guard let intent = intentById[intentId] else { return nil }
+                // Absolute guard first: the utterance must resemble this
+                // word at least as much as the word's own clips resemble
+                // each other across exchanges. Relative ranking always has
+                // a leader; this is what lets the answer be "nothing".
+                let bestSimilarity = meanBestSimilarity[intentId] ?? 0
+                if usesSimilarityFloor, let wordFloor = similarityFloors[intentId], bestSimilarity < wordFloor {
+                    return nil
+                }
                 let calibrator = calibrators[intentId] ?? .uncalibrated
                 let probability = calibrator.probability(of: z)
                 guard probability >= floor else { return nil }
@@ -523,7 +554,8 @@ final class SuggestionEngine {
                     probability: probability,
                     prior: prior,
                     rankingScore: probability * prior,
-                    votes: votes[intentId] ?? 0
+                    votes: votes[intentId] ?? 0,
+                    bestSimilarity: bestSimilarity
                 )
             }
             .sorted { lhs, rhs in

@@ -90,6 +90,19 @@ final class RankingTests: XCTestCase {
         XCTAssertLessThan(protoSim, bestExemplarSim - 0.2)
     }
 
+    func testBestSimilarityIsRawAndUnweighted() {
+        // The absolute guard must see the real cosine: a stale exemplar's
+        // weighted score is quartered, its bestSimilarity is not.
+        let query = EmbeddingFixtures.axis(0)
+        let stale = vec("old", intent: "word", EmbeddingFixtures.near(0, leaning: 1, by: 0.05), ageDays: 900)
+        let other = vec("w", intent: "other", EmbeddingFixtures.near(1, leaning: 0, by: 0.3), ageDays: 1)
+        let ranked = IntentRanker.rank(query: query, exemplars: [stale, other], now: now)
+        let word = ranked.first { $0.intentId == "word" }!
+        let expected = Double(VectorMath.cosine(query, stale.vector))
+        XCTAssertEqual(word.bestSimilarity, expected, accuracy: 1e-6)
+        XCTAssertLessThan(word.score, word.bestSimilarity, "the weighted score decayed; the raw similarity did not")
+    }
+
     func testRecencyWeightingPrefersFreshEvidence() {
         // The old exemplar matches slightly BETTER raw, but it is two
         // half-lives stale (weight 0.25 + 0.75·0.25 ≈ 0.44) — the fresh

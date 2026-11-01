@@ -20,6 +20,16 @@ enum MaturityGate {
         /// Distinct capture sessions required before the gate can open.
         var minSessions = 3
         var minLooHitRate = 0.7
+        /// Self-similarity floor (the absolute guard): for every exemplar
+        /// of the word, its best raw cosine to the word's exemplars from
+        /// OTHER sessions is collected; the floor is this quantile of those
+        /// values minus `selfSimilarityTolerance`. An utterance whose best
+        /// match to the word falls under the floor is never suggested as
+        /// that word, however it ranks against the other words. This is
+        /// what stops a one-word dictionary answering "Football?" to
+        /// everything he says: relative ranking alone always has a leader.
+        var selfSimilarityQuantile = 0.1
+        var selfSimilarityTolerance = 0.02
         var ranker = IntentRanker.Config()
         /// Above this many exemplars the N×N matrix (N² floats: 64 MB at
         /// 4000) is not materialized; rows are computed one at a time.
@@ -34,6 +44,13 @@ enum MaturityGate {
         /// nil until there are enough exemplars and sessions to evaluate.
         let looTop3HitRate: Double?
         let isSuggestible: Bool
+        /// Minimum raw cosine an utterance must reach against this word's
+        /// exemplars to be suggested as it (see `Config.selfSimilarityQuantile`).
+        /// nil until evaluable.
+        let selfSimilarityFloor: Double?
+        /// Median cross-session self-similarity, for display ("its clips
+        /// match each other at 0.91").
+        let typicalSelfSimilarity: Double?
 
         var id: String { intentId }
 
@@ -41,17 +58,44 @@ enum MaturityGate {
              exemplarCount: Int,
              sessionCount: Int = 0,
              looTop3HitRate: Double?,
-             isSuggestible: Bool) {
+             isSuggestible: Bool,
+             selfSimilarityFloor: Double? = nil,
+             typicalSelfSimilarity: Double? = nil) {
             self.intentId = intentId
             self.exemplarCount = exemplarCount
             self.sessionCount = sessionCount
             self.looTop3HitRate = looTop3HitRate
             self.isSuggestible = isSuggestible
+            self.selfSimilarityFloor = selfSimilarityFloor
+            self.typicalSelfSimilarity = typicalSelfSimilarity
         }
 
         static func empty(intentId: String) -> Report {
             Report(intentId: intentId, exemplarCount: 0, sessionCount: 0, looTop3HitRate: nil, isSuggestible: false)
         }
+    }
+
+    /// Floor and median from the collected cross-session best
+    /// self-similarities. Shared by the reference and fast paths so they
+    /// agree exactly. Empty input gives nils.
+    static func selfSimilarityStats(_ values: [Double], config: Config) -> (floor: Double?, median: Double?) {
+        guard !values.isEmpty else { return (nil, nil) }
+        let sorted = values.sorted()
+        return (
+            quantile(sorted, config.selfSimilarityQuantile) - config.selfSimilarityTolerance,
+            quantile(sorted, 0.5)
+        )
+    }
+
+    /// Linear-interpolated quantile of an ascending-sorted array.
+    static func quantile(_ sorted: [Double], _ q: Double) -> Double {
+        guard let first = sorted.first else { return 0 }
+        guard sorted.count > 1 else { return first }
+        let position = min(max(q, 0), 1) * Double(sorted.count - 1)
+        let lower = Int(position.rounded(.down))
+        let upper = min(lower + 1, sorted.count - 1)
+        let fraction = position - Double(lower)
+        return sorted[lower] + (sorted[upper] - sorted[lower]) * fraction
     }
 
     /// Reports cached on the sorted exemplar id set, so a reload that did
@@ -90,23 +134,32 @@ enum MaturityGate {
         }
 
         var hitCount = 0
+        var selfSimilarities: [Double] = []
         for (sessionKey, held) in sessions {
             let rest = index.filter { $0.sessionKey != sessionKey }
+            let ownRest = rest.filter { $0.intentId == intentId }
             for exemplar in held {
                 let top3 = IntentRanker.rank(query: exemplar.vector, exemplars: rest, now: now, config: config.ranker)
                     .prefix(3)
                 if top3.contains(where: { $0.intentId == intentId }) {
                     hitCount += 1
                 }
+                // Raw cosine, unweighted: the absolute guard must not drift
+                // with recency.
+                let best = ownRest.map { VectorMath.cosine(exemplar.vector, $0.vector) }.max() ?? -1
+                selfSimilarities.append(best)
             }
         }
         let hitRate = Double(hitCount) / Double(own.count)
+        let stats = selfSimilarityStats(selfSimilarities, config: config)
         return Report(
             intentId: intentId,
             exemplarCount: own.count,
             sessionCount: sessions.count,
             looTop3HitRate: hitRate,
-            isSuggestible: hitRate >= config.minLooHitRate
+            isSuggestible: hitRate >= config.minLooHitRate,
+            selfSimilarityFloor: stats.floor,
+            typicalSelfSimilarity: stats.median
         )
     }
 
@@ -174,14 +227,19 @@ enum MaturityGate {
             }
 
             var hitCount = 0
+            var selfSimilarities: [Double] = []
+            let intentSlot = slotByIntent[intentId] ?? -1
             for i in own {
                 similarity.fill(row: i, into: &row)
                 let heldSession = sessionKeys[i]
 
                 // Weighted similarity over the rest (held session removed),
                 // then mean / population std exactly as the ranker does.
+                // Alongside: the best raw cosine to the word's own exemplars
+                // in other sessions, for the self-similarity floor.
                 var sum = 0.0
                 var count = 0
+                var bestOwn = -1.0
                 for j in 0..<n {
                     if sessionKeys[j] == heldSession {
                         eligible[j] = false
@@ -189,11 +247,14 @@ enum MaturityGate {
                         continue
                     }
                     eligible[j] = true
-                    let w = max(0, Double(row[j])) * weights[j]
+                    let raw = Double(row[j])
+                    if slotOf[j] == intentSlot, raw > bestOwn { bestOwn = raw }
+                    let w = max(0, raw) * weights[j]
                     weighted[j] = w
                     sum += w
                     count += 1
                 }
+                selfSimilarities.append(bestOwn)
                 guard count > 0 else { continue }
                 let mean = sum / Double(count)
                 var sumSq = 0.0
@@ -232,12 +293,15 @@ enum MaturityGate {
             }
 
             let hitRate = Double(hitCount) / Double(own.count)
+            let stats = selfSimilarityStats(selfSimilarities, config: config)
             reports[intentId] = Report(
                 intentId: intentId,
                 exemplarCount: own.count,
                 sessionCount: sessionCount,
                 looTop3HitRate: hitRate,
-                isSuggestible: hitRate >= config.minLooHitRate
+                isSuggestible: hitRate >= config.minLooHitRate,
+                selfSimilarityFloor: stats.floor,
+                typicalSelfSimilarity: stats.median
             )
         }
         return reports

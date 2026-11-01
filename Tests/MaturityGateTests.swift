@@ -172,7 +172,66 @@ final class MaturityGateTests: XCTestCase {
             default:
                 XCTFail("\(intent): hit rate presence differs (fast \(String(describing: quick.looTop3HitRate)), reference \(String(describing: reference.looTop3HitRate)))", file: file, line: line)
             }
+            // The fast path reads Float cosines from the Gram matrix, the
+            // reference computes Double cosines per pair: agree to 1e-4.
+            switch (quick.selfSimilarityFloor, reference.selfSimilarityFloor) {
+            case let (q?, r?):
+                XCTAssertEqual(q, r, accuracy: 1e-4, "\(intent) self-similarity floor", file: file, line: line)
+            case (nil, nil):
+                break
+            default:
+                XCTFail("\(intent): floor presence differs", file: file, line: line)
+            }
+            switch (quick.typicalSelfSimilarity, reference.typicalSelfSimilarity) {
+            case let (q?, r?):
+                XCTAssertEqual(q, r, accuracy: 1e-4, "\(intent) typical self-similarity", file: file, line: line)
+            case (nil, nil):
+                break
+            default:
+                XCTFail("\(intent): typical self-similarity presence differs", file: file, line: line)
+            }
         }
+    }
+
+    func testSelfSimilarityFloorComesFromCrossSessionMatches() {
+        // Six banana clips, each its own session, each leaning a different
+        // way by 0.08: every cross-session best match is exactly
+        // 1/(1+0.08²). Floor = that minus the tolerance; median = that.
+        var index = cluster(intent: "banana", axis: 0, count: 6, prefix: "b")
+        index += cluster(intent: "water", axis: 1, count: 5, prefix: "w")
+        let config = MaturityGate.Config()
+        let expected = 1.0 / (1.0 + 0.08 * 0.08)
+
+        let report = MaturityGate.evaluate(intentId: "banana", index: index, now: now, config: config)
+        XCTAssertEqual(report.typicalSelfSimilarity ?? .nan, expected, accuracy: 1e-6)
+        XCTAssertEqual(report.selfSimilarityFloor ?? .nan, expected - config.selfSimilarityTolerance, accuracy: 1e-6)
+
+        // Not evaluable → no floor (nothing to guard; the word is not
+        // suggestible anyway).
+        let few = MaturityGate.evaluate(intentId: "banana", index: Array(index.prefix(3)), now: now, config: config)
+        XCTAssertNil(few.selfSimilarityFloor)
+        XCTAssertNil(few.typicalSelfSimilarity)
+
+        // Siblings in the same session never count as a match: one chip
+        // per session held out against itself would give 1.0.
+        let oneExchange = (0..<5).map { i in
+            vec("same\(i)", intent: "same", EmbeddingFixtures.near(2, leaning: 3, by: 0.1), session: "s0")
+        }
+        let twoMore = [
+            vec("same5", intent: "same", EmbeddingFixtures.near(2, leaning: 4, by: 0.1), session: "s1"),
+            vec("same6", intent: "same", EmbeddingFixtures.near(2, leaning: 5, by: 0.1), session: "s2"),
+        ]
+        let same = MaturityGate.evaluate(intentId: "same", index: index + oneExchange + twoMore, now: now, config: config)
+        XCTAssertLessThan(same.typicalSelfSimilarity ?? 1, 1.0,
+                          "identical chips of one exchange are not evidence of self-similarity")
+    }
+
+    func testQuantileInterpolates() {
+        XCTAssertEqual(MaturityGate.quantile([1, 2, 3, 4], 0.5), 2.5, accuracy: 1e-12)
+        XCTAssertEqual(MaturityGate.quantile([1, 2, 3, 4], 0), 1, accuracy: 1e-12)
+        XCTAssertEqual(MaturityGate.quantile([1, 2, 3, 4], 1), 4, accuracy: 1e-12)
+        XCTAssertEqual(MaturityGate.quantile([7], 0.3), 7, accuracy: 1e-12)
+        XCTAssertEqual(MaturityGate.quantile([], 0.3), 0, accuracy: 1e-12)
     }
 
     func testFastPathMatchesReferenceImplementation() {
