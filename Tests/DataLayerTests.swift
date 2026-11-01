@@ -688,4 +688,81 @@ final class DataLayerTests: XCTestCase {
         XCTAssertEqual(try Maintenance.closeOpenSessions(db: db, now: now), 0)
         XCTAssertNil(try db.dbQueue.read { try SessionRecord.fetchOne($0, key: "live") }?.endedAt)
     }
+
+    // MARK: - Phase 3: board edits and per-week outcome helpers
+
+    func testBoardMoveAndSwapAreTheOnlySlotChanges() throws {
+        let intents = IntentStore(db: db)
+        let board = BoardStore(db: db)
+        let banana = IntentRecord(label: "banana")
+        let cup = IntentRecord(label: "cup")
+        let water = IntentRecord(label: "water")
+        for intent in [banana, cup, water] {
+            try intents.insert(intent)
+            try board.place(intentId: intent.id)
+        }
+        XCTAssertEqual(try board.occupiedSlots(), [0: banana.id, 1: cup.id, 2: water.id])
+
+        // Editing details never touches the slot.
+        try intents.updateDetails(id: cup.id, label: "cup!", photoRef: nil, respondNote: "hand him the blue cup")
+        XCTAssertEqual(try intents.fetch(id: cup.id)?.boardSlot, 1)
+
+        // A move into a free slot, a refused move, a swap.
+        try board.move(intentId: water.id, toSlot: 4)
+        XCTAssertThrowsError(try board.move(intentId: banana.id, toSlot: 4))
+        try board.swap(banana.id, cup.id)
+        XCTAssertEqual(try board.occupiedSlots(), [1: banana.id, 0: cup.id, 4: water.id])
+
+        let cells = BoardLayout.cells(for: try board.boardIntents())
+        XCTAssertEqual(cells.count, 5)
+        XCTAssertEqual(cells[0]?.id, cup.id)
+        XCTAssertEqual(cells[1]?.id, banana.id)
+        XCTAssertNil(cells[2])
+        XCTAssertNil(cells[3])
+        XCTAssertEqual(cells[4]?.id, water.id)
+
+        // An archived word is off the board and cannot be moved there.
+        try intents.archive(id: water.id)
+        XCTAssertThrowsError(try board.move(intentId: water.id, toSlot: 4))
+        XCTAssertEqual(try board.occupiedSlots(), [1: banana.id, 0: cup.id])
+    }
+
+    func testSessionOutcomesMatchExchangeOutcomes() throws {
+        let banana = IntentRecord(label: "banana")
+        try IntentStore(db: db).insert(banana)
+        let events = EventLog(db: db)
+
+        // Resolved by a confirm event.
+        try addSession(id: "confirmed", startedAt: now.addingTimeInterval(-3 * 86_400))
+        try addSegment(id: "c1", sessionId: "confirmed", startedAt: now.addingTimeInterval(-3 * 86_400),
+                       state: .labelled, labelledAt: now.addingTimeInterval(-3 * 86_400 + 30), withClip: false)
+        try events.log(EventRecord(exchangeId: "confirmed", type: .confirm, intentId: banana.id,
+                                   latencyMs: 30_000, device: "Kitchen",
+                                   timestamp: now.addingTimeInterval(-3 * 86_400 + 30)))
+        // Abandoned: expired segment, no resolution.
+        try addSession(id: "lost", startedAt: now.addingTimeInterval(-2 * 86_400))
+        try addSegment(id: "l1", sessionId: "lost", startedAt: now.addingTimeInterval(-2 * 86_400),
+                       state: .expired, withClip: false)
+        // Undecided: still pending inside the Review window.
+        try addSession(id: "fresh", startedAt: now.addingTimeInterval(-3600))
+        try addSegment(id: "f1", sessionId: "fresh", startedAt: now.addingTimeInterval(-3600), withClip: false)
+        // Not an exchange with him: everything was the TV.
+        try addSession(id: "tv", startedAt: now.addingTimeInterval(-86_400))
+        try addSegment(id: "t1", sessionId: "tv", startedAt: now.addingTimeInterval(-86_400),
+                       state: .discarded, labelledAt: now.addingTimeInterval(-86_000), withClip: false)
+
+        let since = now.addingTimeInterval(-7 * 86_400)
+        let outcomes = try events.sessionOutcomes(since: since, now: now)
+        XCTAssertEqual(outcomes.map(\.sessionId), ["confirmed", "lost", "tv", "fresh"], "oldest first")
+        XCTAssertEqual(outcomes.map(\.outcome), [.resolved, .abandoned, .notAnExchange, .undecided])
+
+        let totals = try events.exchangeOutcomes(since: since, now: now)
+        XCTAssertEqual(totals.resolved, 1)
+        XCTAssertEqual(totals.abandoned, 1)
+
+        let latencies = try events.confirmLatencyRows(since: since)
+        XCTAssertEqual(latencies.count, 1)
+        XCTAssertEqual(latencies.first?.latencyMs, 30_000)
+        XCTAssertEqual(try events.confirmLatencies(since: since).map(\.medianMs), [30_000])
+    }
 }

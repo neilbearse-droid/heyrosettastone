@@ -101,4 +101,93 @@ final class BoardLayoutTests: XCTestCase {
         try board.place(intentId: third.id)
         XCTAssertEqual(try slot(third.id), 2)
     }
+
+    // MARK: - Phase 3: explicit parent moves (§7, §9)
+
+    func testMoveIntoFreeSlotLeavesOthersAlone() throws {
+        let db = try AppDatabase.inMemory()
+        let intents = IntentStore(db: db)
+        let board = BoardStore(db: db)
+        let banana = IntentRecord(label: "banana")
+        let cup = IntentRecord(label: "cup")
+        for intent in [banana, cup] {
+            try intents.insert(intent)
+            try board.place(intentId: intent.id)
+        }
+
+        try board.move(intentId: banana.id, toSlot: 5)
+        XCTAssertEqual(try intents.fetch(id: banana.id)?.boardSlot, 5)
+        XCTAssertEqual(try intents.fetch(id: cup.id)?.boardSlot, 1, "the other button must not move")
+        XCTAssertEqual(try board.occupiedSlots(), [5: banana.id, 1: cup.id])
+
+        // The grid renders the gap, not a shifted neighbour.
+        let cells = BoardLayout.cells(for: try board.boardIntents())
+        XCTAssertEqual(cells.count, 6)
+        XCTAssertNil(cells[0])
+        XCTAssertEqual(cells[1]?.id, cup.id)
+        XCTAssertEqual(cells[5]?.id, banana.id)
+
+        // Moving to its own slot is a no-op, not an error.
+        try board.move(intentId: banana.id, toSlot: 5)
+        XCTAssertEqual(try intents.fetch(id: banana.id)?.boardSlot, 5)
+    }
+
+    func testMoveRefusesOccupiedSlotUnlessSwapping() throws {
+        let db = try AppDatabase.inMemory()
+        let intents = IntentStore(db: db)
+        let board = BoardStore(db: db)
+        let banana = IntentRecord(label: "banana")
+        let cup = IntentRecord(label: "cup")
+        for intent in [banana, cup] {
+            try intents.insert(intent)
+            try board.place(intentId: intent.id)
+        }
+
+        XCTAssertThrowsError(try board.move(intentId: banana.id, toSlot: 1)) { error in
+            XCTAssertEqual(error as? BoardStoreError, .slotOccupied(slot: 1, by: cup.id))
+        }
+        // Nothing changed.
+        XCTAssertEqual(try intents.fetch(id: banana.id)?.boardSlot, 0)
+        XCTAssertEqual(try intents.fetch(id: cup.id)?.boardSlot, 1)
+
+        try board.move(intentId: banana.id, toSlot: 1, swap: true)
+        XCTAssertEqual(try intents.fetch(id: banana.id)?.boardSlot, 1)
+        XCTAssertEqual(try intents.fetch(id: cup.id)?.boardSlot, 0)
+
+        XCTAssertThrowsError(try board.move(intentId: banana.id, toSlot: -1)) { error in
+            XCTAssertEqual(error as? BoardStoreError, .invalidSlot(-1))
+        }
+    }
+
+    func testSwapRequiresBothOnBoard() throws {
+        let db = try AppDatabase.inMemory()
+        let intents = IntentStore(db: db)
+        let board = BoardStore(db: db)
+        let banana = IntentRecord(label: "banana")
+        let cup = IntentRecord(label: "cup")
+        let outside = IntentRecord(label: "outside")
+        for intent in [banana, cup, outside] {
+            try intents.insert(intent)
+        }
+        try board.place(intentId: banana.id)
+        try board.place(intentId: cup.id)
+
+        try board.swap(banana.id, cup.id)
+        XCTAssertEqual(try intents.fetch(id: banana.id)?.boardSlot, 1)
+        XCTAssertEqual(try intents.fetch(id: cup.id)?.boardSlot, 0)
+
+        let cells = BoardLayout.cells(for: try board.boardIntents())
+        XCTAssertEqual(cells.map { $0?.id }, [cup.id, banana.id])
+
+        XCTAssertThrowsError(try board.swap(banana.id, outside.id)) { error in
+            XCTAssertEqual(error as? BoardStoreError, .notOnBoard(outside.id))
+        }
+        XCTAssertThrowsError(try board.move(intentId: outside.id, toSlot: 4)) { error in
+            XCTAssertEqual(error as? BoardStoreError, .notOnBoard(outside.id))
+        }
+        // A failed swap is atomic: both buttons where they were.
+        XCTAssertEqual(try intents.fetch(id: banana.id)?.boardSlot, 1)
+        XCTAssertEqual(try intents.fetch(id: cup.id)?.boardSlot, 0)
+        XCTAssertNil(try intents.fetch(id: outside.id)?.boardSlot)
+    }
 }

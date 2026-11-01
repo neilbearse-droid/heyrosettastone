@@ -8,6 +8,7 @@ struct DictionaryView: View {
     @State private var intents: [IntentRecord] = []
     @State private var exemplarCounts: [String: Int] = [:]
     @State private var addingNew = false
+    @State private var editingLayout = false
 
     var body: some View {
         NavigationStack {
@@ -44,9 +45,26 @@ struct DictionaryView: View {
                     Button { addingNew = true } label: { Image(systemName: "plus") }
                         .accessibilityLabel("Add a word")
                 }
+                ToolbarItem(placement: .topBarLeading) {
+                    Menu {
+                        Button {
+                            editingLayout = true
+                        } label: {
+                            Label("Edit his board layout", systemImage: "square.grid.2x2")
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                    .accessibilityLabel("More")
+                }
             }
             .sheet(isPresented: $addingNew) {
                 IntentEditorSheet(intent: nil) { reload() }
+            }
+            // Full screen: the warning must be read before the grid is
+            // seen, and the editor needs the board's own geometry (§7).
+            .fullScreenCover(isPresented: $editingLayout) {
+                BoardEditorView(onChange: reload)
             }
             .onAppear(perform: reload)
         }

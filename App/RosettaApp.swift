@@ -1,3 +1,4 @@
+import AVFoundation
 import SwiftUI
 
 @main
@@ -31,6 +32,21 @@ struct RosettaApp: App {
                         env.capture.embedSamples = { [weak env] samples, segmentId in
                             guard let env else { return nil }
                             return await env.suggestions.embedSamples(samples, segmentId: segmentId)
+                        }
+
+                        // Opt-in auto-resume for the counter phone (§8):
+                        // only once setup is done, only if the family
+                        // turned it on, and only when the microphone was
+                        // already granted — never a permission prompt at
+                        // launch. Inside onReady (not after `start`
+                        // returns) because start also runs the long
+                        // backfill. The indicator shows as usual and
+                        // Pause still stops it instantly.
+                        if env.hasCompletedFirstRun,
+                           env.hasCompletedSetupInterview,
+                           env.autoResumeListening,
+                           AVAudioApplication.shared.recordPermission == .granted {
+                            env.capture.startListening()
                         }
                     })
                 }

@@ -1,9 +1,10 @@
 import SwiftUI
 
 /// Top-level navigation: first-run consent → setup interview → the app.
-/// The app itself is either the child's board (full screen, guarded exit)
-/// or the parent tabs. Which of the two is persisted (`childMode`), so a
-/// relaunch of the counter phone lands where it was.
+/// The app itself is the child's board (full screen, guarded exit), the
+/// read-only guest view (same guarded exit), or the parent tabs. Which of
+/// the three is persisted (`childMode` / `guestMode`, mutually exclusive),
+/// so a relaunch of the counter phone lands where it was.
 struct RootView: View {
     @Environment(AppEnvironment.self) private var env
 
@@ -14,6 +15,8 @@ struct RootView: View {
             SetupInterviewView()
         } else if env.childMode {
             ChildBoardScreen(exit: { env.childMode = false })
+        } else if env.guestMode {
+            GuestView(exit: { env.guestMode = false })
         } else {
             ParentTabView(enterChildMode: { env.childMode = true })
         }
@@ -75,13 +78,17 @@ struct ChildBoardScreen: View {
     }
 }
 
-/// The parent's way out of the full-screen board. Deliberately a *hold*,
-/// not a tap, so the child can't fall out of his board by mistake — his
-/// grid is predictable and never leads into parent UI (§3, §7). But unlike
-/// a hidden gesture it is a visible, labelled pill that fills as you hold,
-/// so a parent can find it one-handed and can see the hold is working.
-private struct HoldToExitButton: View {
+/// The parent's way out of the full-screen board (and of the guest view).
+/// Deliberately a *hold*, not a tap, so the child can't fall out of his
+/// board by mistake — his grid is predictable and never leads into parent
+/// UI (§3, §7). But unlike a hidden gesture it is a visible, labelled pill
+/// that fills as you hold, so a parent can find it one-handed and can see
+/// the hold is working.
+struct HoldToExitButton: View {
     let action: () -> Void
+    /// Pill text at rest; the guest view uses a longer one.
+    var title = "Hold to exit"
+    var accessibilityLabel = "Leave the board, back to family view"
 
     @State private var progress: CGFloat = 0
     @State private var isHolding = false
@@ -91,7 +98,7 @@ private struct HoldToExitButton: View {
     var body: some View {
         HStack(spacing: 6) {
             Image(systemName: "lock.open")
-            Text(isHolding ? "Keep holding…" : "Hold to exit")
+            Text(isHolding ? "Keep holding…" : title)
                 .fixedSize()
         }
         .font(.footnote.weight(.semibold))
@@ -121,7 +128,7 @@ private struct HoldToExitButton: View {
                 withAnimation(.easeOut(duration: 0.2)) { progress = 0 }
             }
         })
-        .accessibilityLabel("Leave the board, back to family view")
+        .accessibilityLabel(accessibilityLabel)
         .accessibilityAddTraits(.isButton)
         .accessibilityHint("Press and hold to exit")
     }

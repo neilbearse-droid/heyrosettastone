@@ -19,6 +19,9 @@ struct SettingsView: View {
     @State private var confirmingWipe = false
     @State private var isWiping = false
     @State private var wipeError: String?
+    @State private var buildingReport = false
+    @State private var reportItem: ShareItem?
+    @State private var reportError: String?
 
     var body: some View {
         NavigationStack {
@@ -39,6 +42,28 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    Toggle("Start listening when this station starts up", isOn: Bindable(env).autoResumeListening)
+                } header: {
+                    Text("Listening")
+                } footer: {
+                    Text("Only for a station phone that lives on the counter. The green indicator still shows whenever it is listening, and Pause still stops it instantly. It never asks for the microphone at startup: if permission was not already given, nothing starts.")
+                }
+
+                Section {
+                    Button {
+                        dismiss()
+                        env.guestMode = true
+                    } label: {
+                        Label("Show guest view", systemImage: "person.2")
+                    }
+                    Toggle("Guests can see live guesses", isOn: Bindable(env).guestsSeeLiveGuesses)
+                } header: {
+                    Text("Guest mode")
+                } footer: {
+                    Text("A read-only view for grandparents, EAs and respite workers: what he says, what it usually means, and how to respond. Nothing can be changed from it; hold the pill at the top to come back here.")
+                }
+
+                Section {
                     Toggle("Include audio in device backups", isOn: $includeAudioInBackup)
                         .onChange(of: includeAudioInBackup) {
                             UserDefaults.standard.set(includeAudioInBackup, forKey: "includeAudioInBackup")
@@ -53,10 +78,28 @@ struct SettingsView: View {
                         Label("Share seed list for his SLP", systemImage: "square.and.arrow.up")
                     }
                     .disabled(slpSummary.isEmpty)
+
+                    Button {
+                        buildSLPReport()
+                    } label: {
+                        if buildingReport {
+                            HStack {
+                                ProgressView()
+                                Text("Preparing report…")
+                                    .foregroundStyle(.secondary)
+                            }
+                        } else {
+                            Label("Report for his SLP (PDF)", systemImage: "doc.richtext")
+                        }
+                    }
+                    .disabled(buildingReport)
+                    if let reportError {
+                        Text(reportError).font(.footnote).foregroundStyle(.red)
+                    }
                 } header: {
                     Text("His words")
                 } footer: {
-                    Text("A one-page text summary of his dictionary with how often each word has come up — no audio, no photos — for his speech-language pathologist.")
+                    Text("The seed list is a one-page text summary of his dictionary with how often each word has come up. The PDF report adds when and where each word comes up and how the dictionary has grown week by week. Neither contains audio or photos.")
                 }
 
                 Section {
@@ -131,6 +174,9 @@ struct SettingsView: View {
                 }
             }
             .sheet(item: Bindable(export).result) { item in
+                ActivityShareSheet(item: item)
+            }
+            .sheet(item: $reportItem) { item in
                 ActivityShareSheet(item: item)
             }
             // Folder only: a security-scoped URL to rosetta.json alone does
@@ -234,6 +280,43 @@ struct SettingsView: View {
 
     private func refreshSLPSummary() {
         slpSummary = SeedListSummary.text(db: env.db, labeller: env.labeller)
+    }
+
+    /// §6 SLP report: the summary is built off the main thread (it reads
+    /// every exemplar), the PDF is drawn on the main thread (UIKit text
+    /// drawing; small), written to a temp file and handed to the share
+    /// sheet. Maturity comes from the engine's reports, read here on the
+    /// main actor, and is passed in as plain values.
+    private func buildSLPReport() {
+        guard !buildingReport else { return }
+        buildingReport = true
+        reportError = nil
+        let db = env.db
+        let labeller = env.labeller
+        let maturity: [MaturityGate.Report]? = env.suggestions.isModelAvailable
+            ? env.suggestions.maturityReports
+            : nil
+        Task {
+            let built: Result<SLPReportData, Error> = await Task.detached(priority: .userInitiated) { () -> Result<SLPReportData, Error> in
+                do {
+                    return .success(try SLPReportData.build(db: db, labeller: labeller, maturity: maturity))
+                } catch {
+                    return .failure(error)
+                }
+            }.value
+            switch built {
+            case .success(let data):
+                do {
+                    let url = try SLPReport.writeTemporaryPDF(data)
+                    reportItem = ShareItem(url: url)
+                } catch {
+                    reportError = error.localizedDescription
+                }
+            case .failure(let error):
+                reportError = error.localizedDescription
+            }
+            buildingReport = false
+        }
     }
 }
 

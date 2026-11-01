@@ -31,7 +31,7 @@ struct IntentStore {
     }
 
     /// Updates label, photo, and respond-note. Deliberately does NOT touch
-    /// boardSlot — slot changes go through BoardLayout only (§2.3).
+    /// boardSlot — slot changes go through BoardLayout / BoardStore only (§2.3).
     func updateDetails(id: String, label: String, photoRef: String?, respondNote: String?) throws {
         try db.dbQueue.write { db in
             try db.execute(
@@ -454,23 +454,10 @@ struct EventLog {
     /// done in Swift with `Calendar.current` so an evening confirmation in
     /// North America lands on today, not UTC-tomorrow.
     func confirmLatencies(since: Date, calendar: Calendar = .current) throws -> [(day: Date, medianMs: Int)] {
-        let rows: [(Date, Int)] = try db.dbQueue.read { db in
-            let fetched = try Row.fetchAll(
-                db,
-                sql: """
-                SELECT timestamp, latencyMs FROM events
-                WHERE type = ? AND latencyMs IS NOT NULL AND timestamp >= ?
-                """,
-                arguments: [EventType.confirm.rawValue, since]
-            )
-            return fetched.compactMap { row -> (Date, Int)? in
-                guard let timestamp: Date = row["timestamp"], let ms: Int = row["latencyMs"] else { return nil }
-                return (timestamp, ms)
-            }
-        }
+        let rows = try confirmLatencyRows(since: since)
         var byDay: [Date: [Int]] = [:]
-        for (timestamp, ms) in rows {
-            byDay[calendar.startOfDay(for: timestamp), default: []].append(ms)
+        for row in rows {
+            byDay[calendar.startOfDay(for: row.timestamp), default: []].append(row.latencyMs)
         }
         return byDay
             .map { day, values -> (day: Date, medianMs: Int) in
@@ -478,6 +465,28 @@ struct EventLog {
                 return (day: day, medianMs: sorted[sorted.count / 2])
             }
             .sorted { $0.day < $1.day }
+    }
+
+    /// The raw (confirmation time, ms from exchange open) pairs behind
+    /// `confirmLatencies`, oldest first, for callers that bucket differently
+    /// (the SLP report buckets by ISO week and wants a true weekly median,
+    /// not a median of daily medians).
+    func confirmLatencyRows(since: Date) throws -> [(timestamp: Date, latencyMs: Int)] {
+        try db.dbQueue.read { db in
+            let fetched = try Row.fetchAll(
+                db,
+                sql: """
+                SELECT timestamp, latencyMs FROM events
+                WHERE type = ? AND latencyMs IS NOT NULL AND timestamp >= ?
+                ORDER BY timestamp
+                """,
+                arguments: [EventType.confirm.rawValue, since]
+            )
+            return fetched.compactMap { row -> (timestamp: Date, latencyMs: Int)? in
+                guard let timestamp: Date = row["timestamp"], let ms: Int = row["latencyMs"] else { return nil }
+                return (timestamp: timestamp, latencyMs: ms)
+            }
+        }
     }
 
     /// True when the exchange reached understanding on a parent or child
@@ -516,6 +525,32 @@ struct EventLog {
     /// The counts behind `abandonedRate`, for a positively framed Progress
     /// card ("exchanges that got there: 41 of 48").
     func exchangeOutcomes(since: Date, now: Date = Date()) throws -> (resolved: Int, abandoned: Int) {
+        var resolved = 0
+        var abandoned = 0
+        for session in try sessionOutcomes(since: since, now: now) {
+            switch session.outcome {
+            case .resolved: resolved += 1
+            case .abandoned: abandoned += 1
+            case .undecided, .notAnExchange: continue
+            }
+        }
+        return (resolved: resolved, abandoned: abandoned)
+    }
+
+    /// How one exchange session ended, by the rules in `abandonedRate`.
+    enum ExchangeOutcome: Equatable {
+        case resolved
+        case abandoned
+        /// Still inside the Review window with a segment pending.
+        case undecided
+        /// Every segment was discarded or "not him": never an exchange with him.
+        case notAnExchange
+    }
+
+    /// Per-session outcomes for sessions started since `since` that
+    /// captured at least one segment, oldest first. `exchangeOutcomes`
+    /// totals these; the SLP report buckets them by week.
+    func sessionOutcomes(since: Date, now: Date = Date()) throws -> [(sessionId: String, startedAt: Date, outcome: ExchangeOutcome)] {
         try db.dbQueue.read { db in
             let rows = try Row.fetchAll(
                 db,
@@ -540,6 +575,7 @@ struct EventLog {
                 FROM sessions s
                 WHERE s.startedAt >= ?
                   AND EXISTS (SELECT 1 FROM segments g WHERE g.sessionId = s.id)
+                ORDER BY s.startedAt
                 """,
                 arguments: [
                     EventType.confirm.rawValue,
@@ -550,10 +586,9 @@ struct EventLog {
                     since,
                 ]
             )
-            var resolved = 0
-            var abandoned = 0
+            var outcomes: [(sessionId: String, startedAt: Date, outcome: ExchangeOutcome)] = []
             for row in rows {
-                guard let startedAt: Date = row["startedAt"] else { continue }
+                guard let id: String = row["id"], let startedAt: Date = row["startedAt"] else { continue }
                 let confirmed: Bool = row["confirmed"] ?? false
                 let firstLabelledAt: Date? = row["firstLabelledAt"]
                 let hasPending: Bool = row["hasPending"] ?? false
@@ -567,17 +602,21 @@ struct EventLog {
                     labelledInTime = false
                 }
 
+                let outcome: ExchangeOutcome
                 if confirmed || labelledInTime {
-                    resolved += 1
+                    outcome = .resolved
                 } else if hasPending && now < window {
-                    continue // still in the Review window: undecided
+                    outcome = .undecided // still in the Review window
                 } else if hasPending || hasExpired || firstLabelledAt != nil {
-                    abandoned += 1
+                    outcome = .abandoned
+                } else {
+                    // Every segment was discarded or "not him": not an
+                    // exchange with him, so neither side counts it.
+                    outcome = .notAnExchange
                 }
-                // Otherwise every segment was discarded or "not him": not
-                // an exchange with him, so neither side counts it.
+                outcomes.append((sessionId: id, startedAt: startedAt, outcome: outcome))
             }
-            return (resolved: resolved, abandoned: abandoned)
+            return outcomes
         }
     }
 }

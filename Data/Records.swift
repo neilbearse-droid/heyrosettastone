@@ -18,7 +18,7 @@ struct IntentRecord: Codable, Identifiable, Equatable, FetchableRecord, Persista
     /// "How to respond" note for guests (§4.1).
     var respondNote: String?
     /// Fixed board slot index; nil = not on the board. Assignment is
-    /// append-only — see BoardLayout. Never mutate this outside BoardLayout.
+    /// append-only — see BoardLayout. Never mutate this outside BoardLayout/BoardStore (automatic placement and explicit parent moves from the layout editor).
     var boardSlot: Int?
     var createdAt: Date
     var archivedAt: Date?

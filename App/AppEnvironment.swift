@@ -48,7 +48,39 @@ final class AppEnvironment {
     /// relaunch of the counter phone lands back on the board, not in the
     /// parent tabs (§2.3: his surface is predictable).
     var childMode: Bool {
-        didSet { UserDefaults.standard.set(childMode, forKey: "childMode") }
+        didSet {
+            UserDefaults.standard.set(childMode, forKey: "childMode")
+            // Child mode and guest mode are exclusive: entering one leaves
+            // the other. (guestMode's didSet sees childMode already true
+            // and does nothing, so this cannot recurse.)
+            if childMode && guestMode { guestMode = false }
+        }
+    }
+
+    /// Whether the app is showing the read-only guest view (§3, Phase 3):
+    /// the dictionary as "when he says this it usually means… respond
+    /// by…" cards plus live guesses, for grandparents, EAs and respite
+    /// workers. Persisted like `childMode` so a phone handed to a guest
+    /// stays on that view across a relaunch.
+    var guestMode: Bool {
+        didSet {
+            UserDefaults.standard.set(guestMode, forKey: "guestMode")
+            if guestMode && childMode { childMode = false }
+        }
+    }
+
+    /// Whether the guest view shows the live "Maybe: …?" strip. Default on;
+    /// a family may prefer guests to see only the dictionary.
+    var guestsSeeLiveGuesses: Bool {
+        didSet { UserDefaults.standard.set(guestsSeeLiveGuesses, forKey: "guestsSeeLiveGuesses") }
+    }
+
+    /// Opt-in (§8, default off): a station phone that lives on the counter
+    /// starts listening by itself at launch, provided setup is complete and
+    /// microphone permission was already granted — the app never prompts
+    /// at launch. The indicator still shows and Pause still stops it.
+    var autoResumeListening: Bool {
+        didSet { UserDefaults.standard.set(autoResumeListening, forKey: "autoResumeListening") }
     }
 
     init(db: AppDatabase) {
@@ -58,7 +90,15 @@ final class AppEnvironment {
         self.labeller = UserDefaults.standard.string(forKey: "labellerName") ?? "Parent"
         self.hasCompletedFirstRun = UserDefaults.standard.bool(forKey: "hasCompletedFirstRun")
         self.hasCompletedSetupInterview = UserDefaults.standard.bool(forKey: "hasCompletedSetupInterview")
-        self.childMode = UserDefaults.standard.bool(forKey: "childMode")
+        let childMode = UserDefaults.standard.bool(forKey: "childMode")
+        self.childMode = childMode
+        // Exclusive with childMode; if both were somehow persisted, his
+        // board wins (§2.3: his surface is predictable).
+        self.guestMode = UserDefaults.standard.bool(forKey: "guestMode") && !childMode
+        self.guestsSeeLiveGuesses = UserDefaults.standard.object(forKey: "guestsSeeLiveGuesses") == nil
+            ? true
+            : UserDefaults.standard.bool(forKey: "guestsSeeLiveGuesses")
+        self.autoResumeListening = UserDefaults.standard.bool(forKey: "autoResumeListening")
     }
 
     static func live() -> AppEnvironment {
